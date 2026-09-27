@@ -307,6 +307,11 @@ const KNOWN_EVENTS = new Set([
   "Unfrozen",
   // policy-engine events
   "PolicyResult",
+  // multisig-admin events (symbol_short! names from the contract)
+  "SignerAdd",
+  "SignerRm",
+  "ThreshSet",
+  "AuthOk",
 ]);
 
 export function decodeEvent(
@@ -366,6 +371,9 @@ export function decodeEvent(
           policyFrom: null,
           policyTo: null,
           policyPassed: null,
+          signerAddress: null,
+          newThreshold: null,
+          validCount: null,
           rawTopics: JSON.stringify(raw.topic),
           rawData: raw.value ?? "",
         };
@@ -419,6 +427,108 @@ export function decodeEvent(
         policyFrom,
         policyTo,
         policyPassed: passedVal.value,
+        signerAddress: null,
+        newThreshold: null,
+        validCount: null,
+        rawTopics: JSON.stringify(raw.topic),
+        rawData: raw.value ?? "",
+      };
+    }
+
+    // ── multisig-admin signer/threshold events ────────────────────────────────
+    //
+    // These events use symbol_short! names and have different topic shapes:
+    //
+    //   SignerAdd  topics: [Symbol("SignerAdd"), Address(signer)]  data: Void
+    //   SignerRm   topics: [Symbol("SignerRm"),  Address(signer)]  data: Void
+    //   ThreshSet  topics: [Symbol("ThreshSet")]                   data: U32
+    //   AuthOk     topics: [Symbol("AuthOk")]
+    //              data:   (U32(valid_count), U32(threshold)) — Soroban encodes
+    //                      a Rust tuple (u32, u32) as a two-element ScVec.
+    //
+    // ThreshSet and AuthOk only have 1 topic, so they must be handled before
+    // the section that unconditionally reads topics[1] as an Address.
+
+    if (eventType === "SignerAdd" || eventType === "SignerRm") {
+      if (topics.length < 2) return null;
+      const signerVal = topics[1];
+      if (signerVal.type !== "Address") return null;
+      return {
+        ledgerSequence: raw.ledger,
+        timestamp,
+        contractId: raw.contractId,
+        eventType,
+        address: null,
+        addressTo: null,
+        amount: null,
+        jurisdiction: null,
+        kind: null,
+        source: null,
+        detail: null,
+        policyFrom: null,
+        policyTo: null,
+        policyPassed: null,
+        signerAddress: signerVal.value,
+        newThreshold: null,
+        validCount: null,
+        rawTopics: JSON.stringify(raw.topic),
+        rawData: raw.value ?? "",
+      };
+    }
+
+    if (eventType === "ThreshSet") {
+      if (dataVal.type !== "U32") return null;
+      return {
+        ledgerSequence: raw.ledger,
+        timestamp,
+        contractId: raw.contractId,
+        eventType: "ThreshSet",
+        address: null,
+        addressTo: null,
+        amount: null,
+        jurisdiction: null,
+        kind: null,
+        source: null,
+        detail: null,
+        policyFrom: null,
+        policyTo: null,
+        policyPassed: null,
+        signerAddress: null,
+        newThreshold: dataVal.value,
+        validCount: null,
+        rawTopics: JSON.stringify(raw.topic),
+        rawData: raw.value ?? "",
+      };
+    }
+
+    if (eventType === "AuthOk") {
+      // Soroban encodes the Rust tuple (u32, u32) as a two-element ScVec.
+      let validCount: number | null = null;
+      let newThreshold: number | null = null;
+      if (dataVal.type === "Vec" && dataVal.value.length === 2) {
+        const v0 = dataVal.value[0];
+        const v1 = dataVal.value[1];
+        if (v0.type === "U32") validCount = v0.value;
+        if (v1.type === "U32") newThreshold = v1.value;
+      }
+      return {
+        ledgerSequence: raw.ledger,
+        timestamp,
+        contractId: raw.contractId,
+        eventType: "AuthOk",
+        address: null,
+        addressTo: null,
+        amount: null,
+        jurisdiction: null,
+        kind: null,
+        source: null,
+        detail: null,
+        policyFrom: null,
+        policyTo: null,
+        policyPassed: null,
+        signerAddress: null,
+        newThreshold,
+        validCount,
         rawTopics: JSON.stringify(raw.topic),
         rawData: raw.value ?? "",
       };
@@ -459,6 +569,9 @@ export function decodeEvent(
       policyFrom: null,
       policyTo: null,
       policyPassed: null,
+      signerAddress: null,
+      newThreshold: null,
+      validCount: null,
       rawTopics: JSON.stringify(raw.topic),
       rawData: raw.value ?? "",
     } as const;

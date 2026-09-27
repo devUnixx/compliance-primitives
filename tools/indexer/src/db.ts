@@ -101,6 +101,25 @@ export interface RawEvent {
    * passed (true) or failed (false).
    */
   policyPassed: boolean | null;
+  /**
+   * Populated for multisig-admin SignerAdded/SignerRemoved events:
+   * the signer address that was added or removed.
+   * topics: [Symbol("SignerAdd"|"SignerRm"), Address(signer)], data: Void
+   */
+  signerAddress: string | null;
+  /**
+   * Populated for multisig-admin ThresholdUpdated and AuthOk events:
+   * the (new) threshold value.
+   * ThreshSet: data U32(threshold)
+   * AuthOk:    data Vec[U32(valid_count), U32(threshold)]
+   */
+  newThreshold: number | null;
+  /**
+   * Populated for multisig-admin AuthOk events:
+   * the number of valid signatures that satisfied the threshold.
+   * topics: [Symbol("AuthOk")], data: Vec[U32(valid_count), U32(threshold)]
+   */
+  validCount: number | null;
   rawTopics: string;
   rawData: string;
 }
