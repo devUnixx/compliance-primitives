@@ -74,6 +74,50 @@ fn test_set_and_get_jurisdiction() {
 }
 
 #[test]
+fn test_multi_code_jurisdiction_operations_and_legacy_views() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    let ca = String::from_str(&env, "CA");
+
+    client.set_jurisdiction(&issuer, &alice, &us);
+    client.add_jurisdiction(&issuer, &alice, &ca);
+    client.add_jurisdiction(&issuer, &alice, &ca);
+
+    assert_eq!(client.list_jurisdictions(&alice), vec![&env, us.clone(), ca.clone()]);
+    assert_eq!(client.get_jurisdiction(&alice), Some(us.clone()));
+    assert!(client.is_permitted_jurisdiction(&alice, &vec![&env, ca.clone()]));
+
+    client.remove_jurisdiction(&issuer, &alice, &us);
+    assert_eq!(client.list_jurisdictions(&alice), vec![&env, ca.clone()]);
+    assert_eq!(client.get_jurisdiction(&alice), Some(ca.clone()));
+
+    client.remove_jurisdiction(&issuer, &alice, &ca);
+    assert_eq!(client.list_jurisdictions(&alice), vec![&env]);
+    assert_eq!(client.get_jurisdiction(&alice), None);
+}
+
+#[test]
+fn test_multi_code_jurisdiction_mutations_reject_unauthorized_callers() {
+    let env = Env::default();
+    let (_issuer, _contract_id, client) = setup(&env);
+    let impostor = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let code = String::from_str(&env, "US");
+
+    assert_eq!(
+        client.try_add_jurisdiction(&impostor, &alice, &code),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_remove_jurisdiction(&impostor, &alice, &code),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(client.list_jurisdictions(&alice), vec![&env]);
+}
+
+#[test]
 fn test_budget_regression_is_permitted_jurisdiction() {
     let env = Env::default();
     let (issuer, _contract_id, client) = setup(&env);

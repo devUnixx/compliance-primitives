@@ -10,11 +10,13 @@
 //! matching — it returns `true` if at least one of the address's codes
 //! appears in `allowed_codes`. An address with no codes is never permitted.
 //!
-//! **Callers**: only the configured `issuer` address may call
-//! `set_jurisdiction` / `remove_jurisdiction_multiple`. Any contract or
-//! off-chain client can read a flag via `get_jurisdiction`, and contracts
-//! enforcing a jurisdiction allowlist can call
-//! `is_permitted_jurisdiction(address, allowed_codes)` directly.
+//! **Callers**: the configured issuer or compliance officer may call
+//! `set_jurisdiction` and `add_jurisdiction`; only the issuer may call
+//! `remove_jurisdiction`, `remove_jurisdiction_multiple`, or `upgrade`.
+//! `set_jurisdiction` / `get_jurisdiction` remain single-code conveniences.
+//! Use `add_jurisdiction`, `remove_jurisdiction`, and `list_jurisdictions`
+//! for the multi-code model. Any contract or off-chain client can read codes
+//! and call `is_permitted_jurisdiction(address, allowed_codes)` directly.
 #![no_std]
 
 use soroban_sdk::{
@@ -33,6 +35,7 @@ enum DataKey {
     Issuer,
     ComplianceOfficer,
     Jurisdiction(Address),
+    Jurisdictions(Address),
     Paused,
 }
 
@@ -144,9 +147,9 @@ impl JurisdictionFlag {
     ) -> Result<(), Error> {
         Self::require_compliance_authority(&env, &issuer)?;
 
-        let key = DataKey::Jurisdiction(address.clone());
-        env.storage().persistent().set(&key, &code);
-        Self::extend_jurisdiction_ttl(&env, &key);
+        let mut codes = Vec::new(&env);
+        codes.push_back(code.clone());
+        Self::store_jurisdictions(&env, &address, &codes);
 
         JurisdictionSet {
             address,
@@ -154,6 +157,51 @@ impl JurisdictionFlag {
         }
         .publish(&env);
         Ok(())
+    }
+
+    /// Add `code` to `address`'s jurisdiction codes if it is not already present.
+    /// Issuer or compliance-officer only.
+    pub fn add_jurisdiction(
+        env: Env,
+        issuer: Address,
+        address: Address,
+        code: String,
+    ) -> Result<(), Error> {
+        Self::require_compliance_authority(&env, &issuer)?;
+
+        let mut codes = Self::load_jurisdictions(&env, &address);
+        if !codes.iter().any(|existing| existing == code) {
+            codes.push_back(code.clone());
+            Self::store_jurisdictions(&env, &address, &codes);
+        }
+
+        JurisdictionSet { address, code }.publish(&env);
+        Ok(())
+    }
+
+    /// Remove `code` from `address`'s jurisdiction codes. Issuer-only.
+    pub fn remove_jurisdiction(
+        env: Env,
+        issuer: Address,
+        address: Address,
+        code: String,
+    ) -> Result<(), Error> {
+        Self::require_issuer(&env, &issuer)?;
+
+        let mut remaining = Vec::new(&env);
+        for existing in Self::load_jurisdictions(&env, &address).iter() {
+            if existing != code {
+                remaining.push_back(existing);
+            }
+        }
+        Self::store_jurisdictions(&env, &address, &remaining);
+        JurisdictionRemoved { address }.publish(&env);
+        Ok(())
+    }
+
+    /// Return all jurisdiction codes attached to `address`.
+    pub fn list_jurisdictions(env: Env, address: Address) -> Vec<String> {
+        Self::load_jurisdictions(&env, &address)
     }
 
     /// Remove stored jurisdiction codes for each address in `addresses`.
@@ -164,9 +212,7 @@ impl JurisdictionFlag {
     ) -> Result<(), Error> {
         Self::require_issuer(&env, &issuer)?;
         for address in addresses.iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Jurisdiction(address.clone()));
+            Self::store_jurisdictions(&env, &address, &Vec::new(&env));
             JurisdictionRemoved { address }.publish(&env);
         }
         Ok(())
@@ -174,12 +220,7 @@ impl JurisdictionFlag {
 
     /// Returns the jurisdiction code attached to `address`, if any.
     pub fn get_jurisdiction(env: Env, address: Address) -> Option<String> {
-        let key = DataKey::Jurisdiction(address);
-        let code: Option<String> = env.storage().persistent().get(&key);
-        if code.is_some() {
-            Self::extend_jurisdiction_ttl(&env, &key);
-        }
-        code
+        Self::load_jurisdictions(&env, &address).iter().next()
     }
 
     /// Returns `true` if `address` has a jurisdiction code that appears in
@@ -190,10 +231,10 @@ impl JurisdictionFlag {
         address: Address,
         allowed_codes: Vec<String>,
     ) -> bool {
-        match Self::get_jurisdiction(env, address) {
-            Some(code) => allowed_codes.iter().any(|c| c == code),
-            None => false,
-        }
+        let codes = Self::load_jurisdictions(&env, &address);
+        allowed_codes
+            .iter()
+            .any(|allowed| codes.iter().any(|code| code == allowed))
     }
 
     // -----------------------------------------------------------------------
@@ -252,6 +293,37 @@ impl JurisdictionFlag {
         env.storage()
             .persistent()
             .extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn load_jurisdictions(env: &Env, address: &Address) -> Vec<String> {
+        let list_key = DataKey::Jurisdictions(address.clone());
+        if let Some(codes) = env.storage().persistent().get::<_, Vec<String>>(&list_key) {
+            Self::extend_jurisdiction_ttl(env, &list_key);
+            return codes;
+        }
+
+        let legacy_key = DataKey::Jurisdiction(address.clone());
+        match env.storage().persistent().get::<_, String>(&legacy_key) {
+            Some(code) => {
+                Self::extend_jurisdiction_ttl(env, &legacy_key);
+                Vec::from_array(env, [code])
+            }
+            None => Vec::new(env),
+        }
+    }
+
+    fn store_jurisdictions(env: &Env, address: &Address, codes: &Vec<String>) {
+        let list_key = DataKey::Jurisdictions(address.clone());
+        let legacy_key = DataKey::Jurisdiction(address.clone());
+        if let Some(first_code) = codes.iter().next() {
+            env.storage().persistent().set(&list_key, codes);
+            Self::extend_jurisdiction_ttl(env, &list_key);
+            env.storage().persistent().set(&legacy_key, &first_code);
+            Self::extend_jurisdiction_ttl(env, &legacy_key);
+        } else {
+            env.storage().persistent().remove(&list_key);
+            env.storage().persistent().remove(&legacy_key);
+        }
     }
 }
 
