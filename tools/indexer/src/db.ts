@@ -15,7 +15,10 @@
  *   contract_id     TEXT NOT NULL
  *   event_type      TEXT NOT NULL      — AllowAdd | AllowRemove | Blocked |
  *                                        DenyAdd | DenyRemove | JurisdictionSet |
- *                                        ComplianceEvent
+ *                                        ComplianceEvent | SignerAdd | SignerRm |
+ *                                        ThreshSet | AuthOk | PolicyResult |
+ *                                        AdminSet | DenylistGateSet |
+ *                                        JurisdictionFlagSet | Frozen | Unfrozen
  *   address         TEXT               — primary subject address
  *   address_to      TEXT               — secondary address (Blocked only)
  *   amount          TEXT               — i128 as decimal string (Blocked only)
@@ -23,6 +26,12 @@
  *   kind            TEXT               — audit-log event kind (ComplianceEvent only)
  *   source          TEXT               — audit-log source address (ComplianceEvent only)
  *   detail          TEXT               — audit-log detail string (ComplianceEvent only)
+ *   signer_address  TEXT               — multisig-admin signer (SignerAdd/SignerRm only)
+ *   new_threshold   INTEGER            — multisig-admin threshold (ThreshSet/AuthOk only)
+ *   valid_count     INTEGER            — multisig-admin valid count (AuthOk only)
+ *   policy_from     TEXT               — policy-engine from address (PolicyResult only)
+ *   policy_to       TEXT               — policy-engine to address (PolicyResult only)
+ *   policy_passed   INTEGER            — policy-engine result 0/1 (PolicyResult only)
  *   raw_topics      TEXT NOT NULL      — JSON array of base64-XDR topic strings
  *   raw_data        TEXT NOT NULL      — base64-XDR data value
  *
@@ -85,6 +94,18 @@ export interface RawEvent {
   source: string | null;
   /** Populated for ComplianceEvent: the free-form detail string */
   detail: string | null;
+  /** Populated for multisig-admin SignerAdd/SignerRm events */
+  signerAddress: string | null;
+  /** Populated for multisig-admin ThreshSet/AuthOk events */
+  newThreshold: number | null;
+  /** Populated for multisig-admin AuthOk events: number of valid signers counted */
+  validCount: number | null;
+  /** Populated for policy-engine PolicyResult events */
+  policyFrom: string | null;
+  /** Populated for policy-engine PolicyResult events */
+  policyTo: string | null;
+  /** Populated for policy-engine PolicyResult events */
+  policyPassed: boolean | null;
   rawTopics: string;
   rawData: string;
 }
@@ -143,6 +164,12 @@ export class ComplianceDb {
         kind            TEXT,
         source          TEXT,
         detail          TEXT,
+        signer_address  TEXT,
+        new_threshold   INTEGER,
+        valid_count     INTEGER,
+        policy_from     TEXT,
+        policy_to       TEXT,
+        policy_passed   INTEGER,
         raw_topics      TEXT    NOT NULL,
         raw_data        TEXT    NOT NULL
       );
@@ -155,13 +182,6 @@ export class ComplianceDb {
         ON events (event_type);
       CREATE INDEX IF NOT EXISTS idx_events_ledger
         ON events (ledger_sequence);
-      CREATE INDEX IF NOT EXISTS idx_events_signer
-        ON events (signer_address);
-      CREATE INDEX IF NOT EXISTS idx_events_policy_from
-        ON events (policy_from);
-      CREATE INDEX IF NOT EXISTS idx_events_policy_to
-        ON events (policy_to);
-
       CREATE TABLE IF NOT EXISTS allowlist (
         contract_id TEXT NOT NULL,
         address     TEXT NOT NULL,
@@ -212,6 +232,19 @@ export class ComplianceDb {
       if (!columns.includes("source_tx_hash")) this.db.run("ALTER TABLE events ADD COLUMN source_tx_hash TEXT");
       this.db.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", [2, new Date().toISOString()]);
     }
+    if (currentVersion < 3) {
+      const columns = this.db.exec("PRAGMA table_info(events)")[0]?.values.map((row) => String(row[1])) ?? [];
+      if (!columns.includes("signer_address")) this.db.run("ALTER TABLE events ADD COLUMN signer_address TEXT");
+      if (!columns.includes("new_threshold"))  this.db.run("ALTER TABLE events ADD COLUMN new_threshold INTEGER");
+      if (!columns.includes("valid_count"))    this.db.run("ALTER TABLE events ADD COLUMN valid_count INTEGER");
+      if (!columns.includes("policy_from"))    this.db.run("ALTER TABLE events ADD COLUMN policy_from TEXT");
+      if (!columns.includes("policy_to"))      this.db.run("ALTER TABLE events ADD COLUMN policy_to TEXT");
+      if (!columns.includes("policy_passed"))  this.db.run("ALTER TABLE events ADD COLUMN policy_passed INTEGER");
+      this.db.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", [3, new Date().toISOString()]);
+    }
+    this.db.run("CREATE INDEX IF NOT EXISTS idx_events_signer ON events (signer_address)");
+    this.db.run("CREATE INDEX IF NOT EXISTS idx_events_policy_from ON events (policy_from)");
+    this.db.run("CREATE INDEX IF NOT EXISTS idx_events_policy_to ON events (policy_to)");
     this.flush();
   }
 
@@ -242,21 +275,27 @@ export class ComplianceDb {
       `INSERT INTO events
          (ledger_sequence, timestamp, contract_id, event_type,
           address, address_to, amount, jurisdiction,
-          kind, source, detail,
-          raw_topics, raw_data)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         kind, source, detail, signer_address, new_threshold, valid_count,
+         policy_from, policy_to, policy_passed, raw_topics, raw_data)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         e.ledgerSequence,
         e.timestamp,
         e.contractId,
         e.eventType,
-        e.address,
-        e.addressTo,
-        e.amount,
-        e.jurisdiction,
-        e.kind,
-        e.source,
-        e.detail,
+        e.address ?? null,
+        e.addressTo ?? null,
+        e.amount ?? null,
+        e.jurisdiction ?? null,
+        e.kind ?? null,
+        e.source ?? null,
+        e.detail ?? null,
+        e.signerAddress ?? null,
+        e.newThreshold ?? null,
+        e.validCount ?? null,
+        e.policyFrom ?? null,
+        e.policyTo ?? null,
+        e.policyPassed == null ? null : Number(e.policyPassed),
         e.rawTopics,
         e.rawData,
       ]

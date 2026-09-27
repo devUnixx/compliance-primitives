@@ -137,6 +137,7 @@ The repository’s `prepublishOnly` hook runs typechecking, lint, build, and tes
 | `DB_PATH` | _(required)_ | SQLite file path |
 | `POLL_INTERVAL_MS` | `5000` | How often to poll the RPC node; transient failures use exponential backoff |
 | `START_LEDGER` | `0` | Ledger to start from (0 = auto ~24h ago) |
+| `END_LEDGER` | `0` | Inclusive ledger limit for a bounded backfill; exits after indexing it (0 = poll indefinitely) |
 
 ---
 
@@ -154,11 +155,17 @@ Every compliance event that has ever been observed, in ledger order.
 | `ledger_sequence` | `INTEGER` | Ledger the event landed in |
 | `timestamp` | `INTEGER` | Unix seconds (from ledger close time) |
 | `contract_id` | `TEXT` | Emitting contract |
-| `event_type` | `TEXT` | `AllowAdd` \| `AllowRemove` \| `Blocked` \| `DenyAdd` \| `DenyRemove` \| `JurisdictionSet` |
+| `event_type` | `TEXT` | Primitive, audit-log, circuit-breaker, policy-engine, multisig-admin, or aggregator event name |
 | `address` | `TEXT` | Primary subject address |
 | `address_to` | `TEXT` | Secondary address (`Blocked` only) |
 | `amount` | `TEXT` | Transfer amount as decimal string (`Blocked` only) |
 | `jurisdiction` | `TEXT` | ISO jurisdiction code (`JurisdictionSet` only) |
+| `signer_address` | `TEXT` | Multisig signer for `SignerAdd` / `SignerRm` |
+| `new_threshold` | `INTEGER` | Multisig threshold for `ThreshSet` / `AuthOk` |
+| `valid_count` | `INTEGER` | Valid signer count for `AuthOk` |
+| `policy_from` / `policy_to` | `TEXT` | Addresses evaluated by `PolicyResult` |
+| `policy_passed` | `INTEGER` | `PolicyResult` outcome (`0` or `1`) |
+| `kind` / `source` / `detail` | `TEXT` | Audit-log `ComplianceEvent` fields |
 | `raw_topics` | `TEXT` | JSON array of base64-XDR topic values |
 | `raw_data` | `TEXT` | Base64-XDR data value |
 
@@ -293,10 +300,11 @@ verifiability, and this indexer for cheap, flexible off-chain reporting.
   permanently missed. For a production deployment, run the indexer
   continuously or bootstrap from an archive node.
 
-- **No gap detection**: the indexer does not detect or fill gaps. If a gap
-  occurs, it will silently resume from `last_ledger + 1` with no warning.
-  A production implementation should compare `last_ledger` against the
-  node's `oldestLedger` response and alert if data has been pruned.
+- **Gap and regression detection**: the indexer logs when the event endpoint
+  reports a ledger horizon behind the latest-ledger snapshot or regresses
+  below the saved checkpoint. It retains the last covered checkpoint on a
+  regression, but does not automatically roll back a reorganization or fill
+  gaps after an RPC node has pruned old events.
 
 - **Single-node RPC**: there is no failover between multiple RPC endpoints.
   If the configured node is down, polls will error and retry next tick.
