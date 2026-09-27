@@ -137,6 +137,51 @@ The repository’s `prepublishOnly` hook runs typechecking, lint, build, and tes
 | `DB_PATH` | _(required)_ | SQLite file path |
 | `POLL_INTERVAL_MS` | `5000` | How often to poll the RPC node; transient failures use exponential backoff |
 | `START_LEDGER` | `0` | Ledger to start from (0 = auto ~24h ago) |
+| `HEALTH_PORT` | _(unset)_ | TCP port for the health/metrics HTTP server (see [Health endpoint](#health-endpoint)); omit to disable |
+
+---
+
+## Health endpoint
+
+Set `HEALTH_PORT` to start a minimal HTTP server alongside the indexer. This is useful for process supervisors (systemd, Docker `HEALTHCHECK`, Kubernetes liveness probes) that need to verify the indexer is alive and making progress.
+
+```sh
+HEALTH_PORT=8080 npm start
+# or in Docker:
+docker run --rm -e HEALTH_PORT=8080 … compliance-indexer:latest
+```
+
+### `GET /health`
+
+Returns `200 OK` once the indexer has completed at least one successful poll, `503 Service Unavailable` before that.
+
+```json
+{ "ok": true }
+```
+
+Use this as a Docker `HEALTHCHECK` or Kubernetes liveness probe target.
+
+### `GET /status`
+
+Returns a JSON document with the current indexed ledger height and the timestamp of the last successful poll:
+
+```json
+{
+  "ok": true,
+  "lastIndexedLedger": 1234567,
+  "lastPollAt": "2026-09-27T06:00:00.000Z",
+  "now": "2026-09-27T06:00:05.123Z"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ok` | `boolean` | `true` after the first successful poll |
+| `lastIndexedLedger` | `number \| null` | Last ledger sequence written to the DB |
+| `lastPollAt` | `string \| null` | ISO-8601 timestamp of the last successful poll |
+| `now` | `string` | ISO-8601 timestamp when the response was generated |
+
+The server is not started if `HEALTH_PORT` is unset — the process behaves identically to before.
 
 ---
 
