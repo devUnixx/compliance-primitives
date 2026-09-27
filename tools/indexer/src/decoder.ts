@@ -305,6 +305,8 @@ const KNOWN_EVENTS = new Set([
   "JurisdictionSet",
   "Frozen",
   "Unfrozen",
+  // policy-engine events
+  "PolicyResult",
 ]);
 
 export function decodeEvent(
@@ -361,6 +363,9 @@ export function decodeEvent(
           detail: detailVal?.type === "String" || detailVal?.type === "Symbol"
             ? detailVal.value
             : null,
+          policyFrom: null,
+          policyTo: null,
+          policyPassed: null,
           rawTopics: JSON.stringify(raw.topic),
           rawData: raw.value ?? "",
         };
@@ -375,7 +380,51 @@ export function decodeEvent(
     const eventType = nameVal.value;
     if (!KNOWN_EVENTS.has(eventType)) return null;
 
-    // topics[1] is always the primary address
+    // ── policy-engine PolicyResult ────────────────────────────────────────────
+    //
+    // PolicyResult has a different shape from the address-keyed events:
+    //   topics: [Symbol("PolicyResult"), Bool(passed)]
+    //   data:   Vec[Address(from), Address(to)]
+    //
+    // Handle it here before the section that requires topics[1] to be an
+    // Address.
+    if (eventType === "PolicyResult") {
+      if (topics.length < 2) return null;
+      const passedVal = topics[1];
+      if (passedVal.type !== "Bool") return null;
+
+      let policyFrom: string | null = null;
+      let policyTo: string | null = null;
+
+      // data is Vec[Address(from), Address(to)]
+      if (dataVal.type === "Vec" && dataVal.value.length >= 2) {
+        const fromVal = dataVal.value[0];
+        const toVal = dataVal.value[1];
+        if (fromVal.type === "Address") policyFrom = fromVal.value;
+        if (toVal.type === "Address") policyTo = toVal.value;
+      }
+
+      return {
+        ledgerSequence: raw.ledger,
+        timestamp,
+        contractId: raw.contractId,
+        eventType: "PolicyResult",
+        address: null,
+        addressTo: null,
+        amount: null,
+        jurisdiction: null,
+        kind: null,
+        source: null,
+        detail: null,
+        policyFrom,
+        policyTo,
+        policyPassed: passedVal.value,
+        rawTopics: JSON.stringify(raw.topic),
+        rawData: raw.value ?? "",
+      };
+    }
+
+    // topics[1] is always the primary address for remaining event types
     const addrVal = topics[1];
     if (addrVal.type !== "Address") return null;
     const address = addrVal.value;
@@ -407,6 +456,9 @@ export function decodeEvent(
       kind: null,
       source: null,
       detail: null,
+      policyFrom: null,
+      policyTo: null,
+      policyPassed: null,
       rawTopics: JSON.stringify(raw.topic),
       rawData: raw.value ?? "",
     } as const;
