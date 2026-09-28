@@ -56,46 +56,58 @@ use soroban_sdk::{
 // Events
 // ---------------------------------------------------------------------------
 
-mod events {
-    use soroban_sdk::{symbol_short, Address, Env};
-
-    /// Emitted when a new signer is added to the set.
-    ///
-    /// topics : [Symbol("SignerAdded"), Address(signer)]
-    /// data   : Void
-    pub fn signer_added(env: &Env, signer: &Address) {
-        env.events()
-            .publish((symbol_short!("SignerAdd"), signer.clone()), ());
-    }
-
-    /// Emitted when a signer is removed from the set.
-    ///
-    /// topics : [Symbol("SignerRemoved"), Address(signer)]
-    /// data   : Void
-    pub fn signer_removed(env: &Env, signer: &Address) {
-        env.events()
-            .publish((symbol_short!("SignerRm"), signer.clone()), ());
-    }
-
-    /// Emitted when the signing threshold is updated.
-    ///
-    /// topics : [Symbol("ThresholdSet")]
-    /// data   : u32 (new threshold)
-    pub fn threshold_updated(env: &Env, threshold: u32) {
-        env.events()
-            .publish((symbol_short!("ThreshSet"),), threshold);
-    }
-
-    /// Emitted on every successful `__check_auth` call.
-    ///
-    /// topics : [Symbol("AuthOk")]
-    /// data   : (u32 valid_count, u32 threshold)  — encoded as a two-element
-    ///          Vec so both values travel in a single ScVal.
-    pub fn auth_approved(env: &Env, valid_count: u32, threshold: u32) {
-        env.events()
-            .publish((symbol_short!("AuthOk"),), (valid_count, threshold));
-    }
+/// Emitted when a new signer is added to the set.
+///
+/// topics : [Symbol("SignerAdded"), Address(signer)]
+/// data   : {}
+#[contractevent]
+pub struct SignerAdded {
+    #[topic]
+    pub signer: Address,
 }
+
+/// Emitted when a signer is removed from the set.
+///
+/// topics : [Symbol("SignerRemoved"), Address(signer)]
+/// data   : {}
+#[contractevent]
+pub struct SignerRemoved {
+    #[topic]
+    pub signer: Address,
+}
+
+/// Emitted when the signing threshold is updated.
+///
+/// topics : [Symbol("ThresholdSet")]
+/// data   : { threshold: u32 }
+#[contractevent]
+pub struct ThresholdSet {
+    pub threshold: u32,
+}
+
+/// Emitted on every successful `__check_auth` call.
+///
+/// topics : [Symbol("AuthOk")]
+/// data   : { valid_count: u32, threshold: u32 }
+#[contractevent]
+pub struct AuthOk {
+    pub valid_count: u32,
+    pub threshold: u32,
+}
+
+/// Emitted when the contract is paused.
+///
+/// topics : [Symbol("Paused")]
+/// data   : {}
+#[contractevent]
+pub struct ContractPausedEvent {}
+
+/// Emitted when the contract is unpaused.
+///
+/// topics : [Symbol("Unpaused")]
+/// data   : {}
+#[contractevent]
+pub struct ContractUnpausedEvent {}
 
 // ---------------------------------------------------------------------------
 // Storage
@@ -148,6 +160,12 @@ pub enum Error {
     /// The same signer address appears more than once in the provided
     /// signature set for a single `__check_auth` call.
     DuplicateSignature = 7,
+    /// The contract is paused; no mutating operations are allowed.
+    ContractPaused = 8,
+    /// The referenced proposal does not exist.
+    ProposalNotFound = 9,
+    /// The proposal has passed its expiry ledger sequence.
+    ExpiredProposal = 10,
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +206,7 @@ impl MultisigAdmin {
     pub fn pause(env: Env) -> Result<(), Error> {
         env.current_contract_address().require_auth();
         compliance_pausable::pause(&env);
-        env.events().publish((), soroban_sdk::symbol_short!("Paused"));
+        ContractPausedEvent {}.publish(&env);
         Ok(())
     }
 
@@ -196,7 +214,7 @@ impl MultisigAdmin {
     pub fn unpause(env: Env) -> Result<(), Error> {
         env.current_contract_address().require_auth();
         compliance_pausable::unpause(&env);
-        env.events().publish((), soroban_sdk::symbol_short!("Unpaused"));
+        ContractUnpausedEvent {}.publish(&env);
         Ok(())
     }
 
@@ -231,7 +249,7 @@ impl MultisigAdmin {
 
         signers.push_back(new_signer.clone());
         env.storage().instance().set(&DataKey::Signers, &signers);
-        events::signer_added(&env, &new_signer);
+        SignerAdded { signer: new_signer }.publish(&env);
         Ok(())
     }
 
@@ -270,7 +288,7 @@ impl MultisigAdmin {
         }
 
         env.storage().instance().set(&DataKey::Signers, &signers);
-        events::signer_removed(&env, &signer);
+        SignerRemoved { signer }.publish(&env);
         Ok(())
     }
 
@@ -292,7 +310,7 @@ impl MultisigAdmin {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
-        events::threshold_updated(&env, threshold);
+        ThresholdSet { threshold }.publish(&env);
         Ok(())
     }
 
@@ -540,7 +558,7 @@ impl CustomAccountInterface for MultisigAdmin {
         }
 
         if valid_count >= threshold {
-            events::auth_approved(&env, valid_count, threshold);
+            AuthOk { valid_count, threshold }.publish(&env);
             Ok(())
         } else {
             Err(Error::ThresholdNotMet)
