@@ -3,7 +3,7 @@ extern crate std;
 use super::*;
 use denylist_gate::{DenylistGate, DenylistGateClient};
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     vec, Address, Bytes, Env,
 };
 
@@ -331,4 +331,186 @@ fn test_check_auth_distinct_signers_not_flagged_as_duplicate() {
     let sigs = vec![&env, signers.get(0).unwrap(), signers.get(1).unwrap()];
     let result = MultisigAdmin::__check_auth(env.clone(), payload, sigs, Vec::new(&env));
     assert_eq!(result, Ok(()));
+}
+
+// ---------------------------------------------------------------------------
+// Proposal / approve / execute workflow — #400
+// ---------------------------------------------------------------------------
+
+/// Audit result: `add_signer`, `remove_signer`, and `update_threshold` all go
+/// through `env.current_contract_address().require_auth()`, which triggers
+/// `__check_auth`. `__check_auth` counts DISTINCT valid signer addresses in the
+/// provided `Vec<Address>` and rejects if the count is below `threshold`.
+/// This IS real M-of-N enforcement; it is not a single-signer check.
+///
+/// The tests below verify the separate `propose` → `approve` → `execute`
+/// workflow, which accumulates per-signer approvals in persistent storage and
+/// only allows execution once `threshold` distinct approvals are recorded.
+
+/// Proposing creates a proposal with zero approvals and returns its ID.
+#[test]
+fn test_propose_creates_proposal_with_zero_approvals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_signers, _id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[1u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry).unwrap();
+
+    assert_eq!(proposal_id, 0u64);
+    let (stored_payload, stored_expiry, approvals) = client.get_proposal(&0).unwrap();
+    assert_eq!(stored_payload, payload);
+    assert_eq!(stored_expiry, expiry);
+    assert_eq!(approvals.len(), 0);
+}
+
+/// Each signer can approve once; approve() returns true when threshold is met.
+#[test]
+fn test_approve_accumulates_distinct_approvals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[2u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry).unwrap();
+
+    // First approval — threshold not yet met (1 < 2).
+    let ready = client.approve(&proposal_id, &signers.get(0).unwrap()).unwrap();
+    assert!(!ready, "should not be ready after 1 of 2 approvals");
+
+    // Second approval — threshold met (2 >= 2).
+    let ready = client.approve(&proposal_id, &signers.get(1).unwrap()).unwrap();
+    assert!(ready, "should be ready after 2 of 2 approvals");
+}
+
+/// A signer cannot approve the same proposal twice; the second call returns
+/// Ok(false) without double-counting toward the threshold.
+#[test]
+fn test_approve_same_signer_twice_does_not_double_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[3u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry).unwrap();
+
+    let signer0 = signers.get(0).unwrap();
+    client.approve(&proposal_id, &signer0).unwrap();
+    // Second call from the same signer — should not increment the count.
+    let ready = client.approve(&proposal_id, &signer0).unwrap();
+    assert!(!ready, "duplicate approval must not push the count to threshold");
+
+    // Verify only 1 approval is stored.
+    let (_, _, approvals) = client.get_proposal(&proposal_id).unwrap();
+    assert_eq!(approvals.len(), 1);
+}
+
+/// Non-signer cannot approve a proposal.
+#[test]
+fn test_approve_by_non_signer_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_signers, _id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[4u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry).unwrap();
+
+    let outsider = Address::generate(&env);
+    let result = client.try_approve(&proposal_id, &outsider);
+    assert_eq!(result, Err(Ok(Error::ThresholdNotMet)));
+}
+
+/// execute() succeeds once the threshold is met.
+#[test]
+fn test_execute_succeeds_when_threshold_met() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[5u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry).unwrap();
+
+    client.approve(&proposal_id, &signers.get(0).unwrap()).unwrap();
+    client.approve(&proposal_id, &signers.get(1).unwrap()).unwrap();
+
+    // Should succeed — proposal is deleted after execution.
+    client.execute(&proposal_id).unwrap();
+
+    // Proposal should no longer exist.
+    let result = client.try_get_proposal(&proposal_id);
+    assert_eq!(result, Err(Ok(Error::ProposalNotFound)));
+}
+
+/// execute() is rejected if fewer than threshold approvals are recorded.
+#[test]
+fn test_execute_fails_when_threshold_not_met() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[6u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry).unwrap();
+
+    // Only 1 of 2 required approvals.
+    client.approve(&proposal_id, &signers.get(0).unwrap()).unwrap();
+
+    let result = client.try_execute(&proposal_id);
+    assert_eq!(result, Err(Ok(Error::ThresholdNotMet)));
+}
+
+/// Proposals cannot be approved or executed after they expire.
+#[test]
+fn test_expired_proposal_cannot_be_approved_or_executed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[7u8; 32]);
+    let expiry = env.ledger().sequence() + 5;
+    let proposal_id = client.propose(&payload, &expiry).unwrap();
+
+    // Advance ledger past expiry.
+    env.ledger().set_sequence_number(expiry);
+
+    let approve_result = client.try_approve(&proposal_id, &signers.get(0).unwrap());
+    assert_eq!(approve_result, Err(Ok(Error::ExpiredProposal)));
+
+    let execute_result = client.try_execute(&proposal_id);
+    assert_eq!(execute_result, Err(Ok(Error::ExpiredProposal)));
+}
+
+/// Proposal IDs are assigned sequentially starting from 0.
+#[test]
+fn test_proposal_ids_are_sequential() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_signers, _id, client) = setup_multisig(&env, 2, 1);
+
+    let payload = Bytes::from_array(&env, &[0u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+
+    let id0 = client.propose(&payload, &expiry).unwrap();
+    let id1 = client.propose(&payload, &expiry).unwrap();
+    let id2 = client.propose(&payload, &expiry).unwrap();
+
+    assert_eq!(id0, 0u64);
+    assert_eq!(id1, 1u64);
+    assert_eq!(id2, 2u64);
+}
+
+/// Approving an unknown proposal returns ProposalNotFound.
+#[test]
+fn test_approve_unknown_proposal_returns_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 2, 1);
+
+    let result = client.try_approve(&999u64, &signers.get(0).unwrap());
+    assert_eq!(result, Err(Ok(Error::ProposalNotFound)));
 }
