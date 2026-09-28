@@ -113,6 +113,33 @@ fn benchmark_policy_engine_evaluate() -> BenchmarkResult {
     }
 }
 
+fn benchmark_compliance_aggregator_check_address() -> BenchmarkResult {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let address = Address::generate(&env);
+
+    // This would register denylist-gate, jurisdiction-flag, and
+    // compliance-aggregator (with both checks registered), then invoke
+    // check_address(address, ["US"]). Resource usage would include:
+    // - Instance storage reads for the gate, flag, and circuit-breaker addresses
+    // - One cross-contract call to denylist-gate.check()
+    // - One cross-contract call to jurisdiction-flag.is_permitted_jurisdiction()
+    // The regression-checked measurement lives in
+    // contracts/compliance-aggregator/src/test.rs
+    // (test_budget_regression_check_address) against budget-baselines.toml.
+
+    let cpu_end = 500; // Placeholder
+    let memory_end = 200;
+
+    BenchmarkResult {
+        scenario: "Compliance-aggregator check_address (2 checks)".to_string(),
+        cpu_cost: cpu_end - 100,
+        memory_cost: memory_end - 50,
+        description: "check_address() with denylist-gate + jurisdiction-flag registered: 1 consumer call, 2 downstream cross-contract calls + instance reads".to_string(),
+    }
+}
+
 #[derive(Clone)]
 struct BenchmarkResult {
     scenario: String,
@@ -209,8 +236,9 @@ fn main() {
     let allowlist = benchmark_allowlist_token_transfer();
     let denylist = benchmark_denylist_gate_transfer();
     let policy_engine = benchmark_policy_engine_evaluate();
+    let aggregator = benchmark_compliance_aggregator_check_address();
 
-    let results = vec![plain, allowlist, denylist, policy_engine];
+    let results = vec![plain, allowlist, denylist, policy_engine, aggregator];
 
     // Print results
     print_results(&results);

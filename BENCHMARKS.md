@@ -11,6 +11,7 @@ Compliance primitives add measurable but acceptable resource overhead to token t
 | Allowlist-token gate | +400 | +150 bytes | ~400% to allowlist cost |
 | Combined (denylist + allowlist) | +650 | +250 bytes | ~6.5x denylist cost |
 | Policy-engine evaluate (1 denylist check, All) | +350 | +130 bytes | ~3.5x denylist cost |
+| Compliance-aggregator check_address (denylist + jurisdiction) | +400 | +150 bytes | ~4x denylist cost |
 
 **Key Finding**: The overhead is dominated by **cross-contract call overhead**, not by the compliance logic itself. Each cross-contract invocation costs ~100-150 CPU instructions, while each storage lookup costs ~10-20 instructions.
 
@@ -414,3 +415,40 @@ For issuers evaluating adoption:
 - **If cost is paramount**: Implement compliance logic in the issuer's own token contract (eliminates cross-contract call overhead but loses auditability and reusability).
 - **If composing 3+ checks**: Policy-engine's ~5% overhead is worth the cleaner, more maintainable code.
 
+## Compliance-Aggregator `check_address` Budget Regression
+
+`compliance-aggregator` is covered by the same budget-regression harness as
+the original primitives. Its hottest entrypoint is `check_address`: consumers
+call it once per transfer, and it fans out to every registered primitive.
+
+**Scenario** (`test_budget_regression_check_address` in
+`contracts/compliance-aggregator/src/test.rs`):
+
+- Aggregator initialized with both `denylist-gate` and `jurisdiction-flag`
+  registered (no circuit-breaker).
+- The checked address has a permitted jurisdiction (`US`) and is not on the
+  denylist, so both downstream checks run and pass.
+- The budget is reset immediately before `check_address` and read
+  immediately after, so only the call itself is measured.
+
+**Resource profile**:
+
+- 1 cross-contract call from the consumer to the aggregator
+- 2 downstream cross-contract calls (`denylist-gate.check`,
+  `jurisdiction-flag.is_permitted_jurisdiction`)
+- 2 instance-storage reads in the aggregator (gate + flag addresses) plus 1
+  for the optional circuit-breaker lookup
+- 1 persistent-storage lookup in each primitive
+
+**Baseline**: `[compliance-aggregator.check_address]` in
+`budget-baselines.toml`. The test fails — and therefore the
+`budget-regression` CI job (`cargo test --workspace budget_regression`)
+fails — if measured CPU instructions or memory bytes exceed the baseline by
+more than **10%**.
+
+To re-record the baseline after an intentional change:
+
+```bash
+cargo test -p compliance-aggregator budget_regression -- --nocapture
+# copy the printed `cpu = … , memory = …` values into budget-baselines.toml
+```

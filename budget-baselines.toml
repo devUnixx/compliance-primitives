@@ -13,3 +13,10 @@ memory = 1
 [policy-engine.evaluate]
 cpu = 1
 memory = 1
+
+# check_address with both denylist-gate and jurisdiction-flag registered
+# (two downstream cross-contract calls). Measured by
+# `cargo test -p compliance-aggregator budget_regression -- --nocapture`.
+[compliance-aggregator.check_address]
+cpu = 1500000
+memory = 400000
