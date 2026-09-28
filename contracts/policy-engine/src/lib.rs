@@ -501,3 +501,6 @@ mod test;
 #[cfg(test)]
 mod fuzz;
 
+#[cfg(test)]
+mod bench;
+
