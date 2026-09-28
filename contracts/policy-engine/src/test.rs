@@ -1,10 +1,7 @@
 use super::*;
-use circuit_breaker::{CircuitBreaker, CircuitBreakerClient as CbClient};
-use denylist_gate::{DenylistGate, DenylistGateClient};
-use jurisdiction_flag::{JurisdictionFlag, JurisdictionFlagClient};
+use super::test_utils::*;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{vec, Env, String};
-use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -211,11 +208,8 @@ fn test_get_policy_matches_configuration() {
     let env = Env::default();
     env.mock_all_auths();
 
-    // Set up two external contracts to use as checks.
-    let deny_admin = Address::generate(&env);
-    let juri_issuer = Address::generate(&env);
-    let deny_id = setup_denylist(&env, &deny_admin);
-    let juri_id = setup_jurisdiction(&env, &juri_issuer);
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
 
     // Initialise with `Any` semantics and add two checks.
     let (admin, _engine_id, client) = setup_engine_any(&env);
@@ -224,16 +218,16 @@ fn test_get_policy_matches_configuration() {
 
     client.add_check(
         &admin,
-        &CheckKind::Denylist {
+        &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
-        },
+        }),
     );
     client.add_check(
         &admin,
-        &CheckKind::Jurisdiction {
+        &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: allowed_codes.clone(),
-        },
+        }),
     );
 
     // Fetch the full policy tree.
@@ -247,19 +241,49 @@ fn test_get_policy_matches_configuration() {
 
     // First check must be the denylist check with the correct contract address.
     match policy.checks.get(0).unwrap() {
-        CheckKind::Denylist { contract } => assert_eq!(contract, deny_id),
+        CheckKind::Denylist(params) => assert_eq!(params.contract, deny_id),
         _ => panic!("expected Denylist check at index 0"),
     }
 
     // Second check must be the jurisdiction check with correct contract and codes.
     match policy.checks.get(1).unwrap() {
-        CheckKind::Jurisdiction {
-            contract,
-            allowed_codes: codes,
-        } => {
-            assert_eq!(contract, juri_id);
-            assert_eq!(codes, allowed_codes);
+        CheckKind::Jurisdiction(params) => {
+            assert_eq!(params.contract, juri_id);
+            assert_eq!(params.allowed_codes, allowed_codes);
         }
         _ => panic!("expected Jurisdiction check at index 1"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for issue #404: get_admin view function
+// ---------------------------------------------------------------------------
+
+/// `get_admin` returns the address that was passed to `initialize`.
+#[test]
+fn test_get_admin_returns_initialized_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    let returned_admin = client.get_admin();
+    assert_eq!(returned_admin, admin, "get_admin should return the initialized admin address");
+}
+
+/// `get_admin` returns `Err(NotInitialized)` when called before `initialize`.
+#[test]
+fn test_get_admin_not_initialized_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Register the contract but do NOT call initialize.
+    let id = env.register(PolicyEngine, ());
+    let client = PolicyEngineClient::new(&env, &id);
+
+    let result = client.try_get_admin();
+    assert!(
+        result.is_err(),
+        "get_admin should return an error before initialization"
+    );
 }

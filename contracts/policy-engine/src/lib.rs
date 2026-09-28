@@ -74,6 +74,14 @@ pub trait CircuitBreakerInterface {
     fn is_frozen(env: Env) -> bool;
 }
 
+/// Describes the `allowlist-token` contract interface used for cross-contract
+/// calls. The generated `AllowlistCheckClient` is used in `run_check` to call
+/// `is_allowed()` on a deployed allowlist-token instance.
+#[contractclient(name = "AllowlistCheckClient")]
+pub trait AllowlistCheckInterface {
+    fn is_allowed(env: Env, address: Address) -> bool;
+}
+
 // ---------------------------------------------------------------------------
 // Storage types
 // ---------------------------------------------------------------------------
@@ -184,6 +192,11 @@ pub enum Error {
     /// exceed `MAX_CHECKS`. Keeps per-evaluation resource cost bounded and
     /// prevents unbounded storage growth.
     MaxDepthExceeded = 5,
+    /// Returned by `add_check` and `remove_check` when the contract has been
+    /// paused via `compliance-pausable`. Mutations are blocked while paused.
+    ContractPaused = 6,
+    /// Returned by `get_check` when the requested index is out of range.
+    CheckIndexOutOfRange = 7,
 }
 
 /// Maximum number of checks that can be registered in a single policy
@@ -220,6 +233,20 @@ pub struct UpgradePerformed {
 pub struct CheckFailure {
     pub check_index: u32,
     pub kind: Symbol,
+}
+
+/// A snapshot of the full policy configuration: the combination operator and
+/// the ordered list of registered checks.
+///
+/// Returned by [`PolicyEngine::get_policy`] so off-chain tooling and auditors
+/// can read back the complete policy in a single view call.
+#[contracttype]
+#[derive(Clone)]
+pub struct PolicyNode {
+    /// How check results are combined (`All` = AND, `Any` = OR).
+    pub op: CombineOp,
+    /// The ordered list of checks that `evaluate` will run.
+    pub checks: Vec<CheckKind>,
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +444,19 @@ impl PolicyEngine {
     // -----------------------------------------------------------------------
     // Read-only accessors
     // -----------------------------------------------------------------------
+
+    /// Returns the current admin address, or `Err(Error::NotInitialized)` if
+    /// the contract has not yet been initialized.
+    ///
+    /// Useful for off-chain tooling, UIs, and other contracts that need to
+    /// verify who controls this policy-engine instance without having to
+    /// replay the initialization transaction.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
 
     /// Returns the current list of registered checks.
     pub fn get_checks(env: Env) -> Vec<CheckKind> {
