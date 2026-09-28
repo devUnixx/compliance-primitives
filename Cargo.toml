@@ -4,6 +4,7 @@ members = [
     "contracts/allowlist-token",
     "contracts/audit-log",
     "contracts/compliance-aggregator",
+    "contracts/compliance-check",
     "contracts/denylist-gate",
     "contracts/jurisdiction-flag",
     "contracts/circuit-breaker",
