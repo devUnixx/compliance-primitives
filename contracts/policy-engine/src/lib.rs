@@ -74,6 +74,14 @@ pub trait CircuitBreakerInterface {
     fn is_frozen(env: Env) -> bool;
 }
 
+/// Describes the `allowlist-token` contract interface used for cross-contract
+/// calls. The generated `AllowlistCheckClient` is used in `run_check` to call
+/// `is_allowed()` on a deployed allowlist-token instance.
+#[contractclient(name = "AllowlistCheckClient")]
+pub trait AllowlistCheckInterface {
+    fn is_allowed(env: Env, address: Address) -> bool;
+}
+
 // ---------------------------------------------------------------------------
 // Storage types
 // ---------------------------------------------------------------------------
@@ -184,6 +192,11 @@ pub enum Error {
     /// exceed `MAX_CHECKS`. Keeps per-evaluation resource cost bounded and
     /// prevents unbounded storage growth.
     MaxDepthExceeded = 5,
+    /// Returned by `add_check` and `remove_check` when the contract has been
+    /// paused via `compliance-pausable`. Mutations are blocked while paused.
+    ContractPaused = 6,
+    /// Returned by `get_check` when the requested index is out of range.
+    CheckIndexOutOfRange = 7,
 }
 
 /// Maximum number of checks that can be registered in a single policy
@@ -212,14 +225,72 @@ pub struct UpgradePerformed {
 }
 
 /// Carries information about which check in the list failed and what kind it
-/// was. Serializable on-chain; can be embedded in future error events or
-/// returned from an extended evaluate variant.
+/// was. Serializable on-chain, so it can be embedded in contract events or
+/// returned from view calls.
+///
+/// ## Intended use
+///
+/// `CheckFailure` is the payload surfaced by [`PolicyEngine::evaluate_verbose`],
+/// an extended variant of `evaluate` that returns the index and kind of the
+/// **first** check that caused the policy to fail, in addition to the overall
+/// pass/fail result. This makes it possible to diagnose a failed policy
+/// evaluation without re-running each check individually in a separate call.
+///
+/// ### Design sketch
+///
+/// ```text
+/// evaluate_verbose(env, from, to)
+///   -> Result<(bool, Option<CheckFailure>), Error>
+/// ```
+///
+/// - When the policy **passes**, the second element is `None`.
+/// - When the policy **fails**, the second element is `Some(CheckFailure)`
+///   where `check_index` is the zero-based position of the first failing check
+///   in the registered `Vec<CheckKind>` and `kind` is a `Symbol` naming the
+///   variant (e.g. `Symbol::new(env, "Denylist")`).
+///
+/// Off-chain tooling (block explorers, compliance dashboards) can call
+/// `evaluate_verbose` once and immediately know both the outcome and, on
+/// failure, precisely which rule triggered the rejection — without needing to
+/// reconstruct the full check list from storage.
+///
+/// ### Why `Option<CheckFailure>` instead of embedding in the error
+///
+/// `evaluate` deliberately returns `Ok(false)` on a policy failure rather than
+/// `Err(...)` so that the emitted `PolicyResult` event is not rolled back (see
+/// the module-level doc comment for the full rationale). `evaluate_verbose`
+/// preserves this invariant: the `CheckFailure` detail rides in the `Ok(…)`
+/// payload alongside the bool, keeping events auditable while surfacing richer
+/// diagnostic data to callers.
+///
+/// ### Tracking
+///
+/// `evaluate_verbose` is implemented in this contract. See the
+/// `evaluate_verbose` function below. Future work could extend `CheckFailure`
+/// with additional fields (e.g. the address that failed, or the full
+/// `CheckKind` payload) if callers need more context.
 #[contracttype]
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct CheckFailure {
+    /// Zero-based index into the `Vec<CheckKind>` of the first failing check.
     pub check_index: u32,
+    /// Short `Symbol` name of the `CheckKind` variant that failed, e.g.
+    /// `"Denylist"`, `"Jurisdiction"`, `"Allowlist"`, or `"CircuitBreaker"`.
     pub kind: Symbol,
+}
+
+/// A snapshot of the full policy configuration: the combination operator and
+/// the ordered list of registered checks.
+///
+/// Returned by [`PolicyEngine::get_policy`] so off-chain tooling and auditors
+/// can read back the complete policy in a single view call.
+#[contracttype]
+#[derive(Clone)]
+pub struct PolicyNode {
+    /// How check results are combined (`All` = AND, `Any` = OR).
+    pub op: CombineOp,
+    /// The ordered list of checks that `evaluate` will run.
+    pub checks: Vec<CheckKind>,
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +485,113 @@ impl PolicyEngine {
         Ok(results)
     }
 
+    /// Like `evaluate`, but on failure also returns a [`CheckFailure`]
+    /// describing the **first** check that caused the policy to fail.
+    ///
+    /// Returns `Ok((true, None))` when the policy passes. Returns
+    /// `Ok((false, Some(CheckFailure { check_index, kind })))` when the
+    /// policy fails, giving callers the zero-based index and the `Symbol`
+    /// name of the failing check kind without needing a second round-trip.
+    ///
+    /// A `PolicyResult` event is emitted just as in `evaluate`, keeping the
+    /// audit trail intact regardless of the outcome. The circuit-breaker
+    /// short-circuit (if configured) is still respected and produces
+    /// `Ok((false, None))` — no index is surfaced in that case because the
+    /// freeze is a system-wide condition rather than a per-check failure.
+    pub fn evaluate_verbose(
+        env: Env,
+        from: Address,
+        to: Address,
+    ) -> Result<(bool, Option<CheckFailure>), Error> {
+        // Emergency freeze short-circuit (same as `evaluate`).
+        let breaker_addr: Option<Address> = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::CircuitBreaker);
+        if let Some(addr) = breaker_addr {
+            if CircuitBreakerClient::new(&env, &addr).is_frozen() {
+                PolicyResult {
+                    passed: false,
+                    from: from.clone(),
+                    to: to.clone(),
+                }
+                .publish(&env);
+                return Ok((false, None));
+            }
+        }
+
+        let checks: Vec<CheckKind> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Checks)
+            .ok_or(Error::NotInitialized)?;
+        let op: CombineOp = env
+            .storage()
+            .instance()
+            .get(&DataKey::CombineOp)
+            .ok_or(Error::NotInitialized)?;
+
+        let (passed, failure) = match op {
+            CombineOp::All => {
+                let mut result = (true, None);
+                for i in 0..checks.len() {
+                    let check = checks.get(i).unwrap();
+                    if !Self::run_check(&env, &check, &from)
+                        || !Self::run_check(&env, &check, &to)
+                    {
+                        result = (
+                            false,
+                            Some(CheckFailure {
+                                check_index: i,
+                                kind: Self::check_kind_symbol(&env, &check),
+                            }),
+                        );
+                        break;
+                    }
+                }
+                result
+            }
+            CombineOp::Any => {
+                if checks.is_empty() {
+                    (false, None)
+                } else {
+                    let mut any_pass = false;
+                    for i in 0..checks.len() {
+                        let check = checks.get(i).unwrap();
+                        if Self::run_check(&env, &check, &from)
+                            && Self::run_check(&env, &check, &to)
+                        {
+                            any_pass = true;
+                            break;
+                        }
+                    }
+                    if any_pass {
+                        (true, None)
+                    } else {
+                        // Surface the first check as the representative failure.
+                        let first = checks.get(0).unwrap();
+                        (
+                            false,
+                            Some(CheckFailure {
+                                check_index: 0,
+                                kind: Self::check_kind_symbol(&env, &first),
+                            }),
+                        )
+                    }
+                }
+            }
+        };
+
+        PolicyResult {
+            passed,
+            from: from.clone(),
+            to: to.clone(),
+        }
+        .publish(&env);
+
+        Ok((passed, failure))
+    }
+
     // -----------------------------------------------------------------------
     // Read-only accessors
     // -----------------------------------------------------------------------
@@ -475,6 +653,16 @@ impl PolicyEngine {
                 let client = AllowlistCheckClient::new(env, &params.contract);
                 client.is_allowed(address)
             }
+        }
+    }
+
+    /// Returns a short `Symbol` naming the `CheckKind` variant for use in
+    /// `CheckFailure`. Kept in sync with the enum variants.
+    fn check_kind_symbol(env: &Env, check: &CheckKind) -> Symbol {
+        match check {
+            CheckKind::Denylist(_) => Symbol::new(env, "Denylist"),
+            CheckKind::Jurisdiction(_) => Symbol::new(env, "Jurisdiction"),
+            CheckKind::Allowlist(_) => Symbol::new(env, "Allowlist"),
         }
     }
 
