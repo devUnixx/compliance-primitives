@@ -325,6 +325,41 @@ The `--cost` flag outputs the actual resource fee, which can be reverse-engineer
 
 5. **Optimize Soroban SDK**: Work with SDF to reduce cross-contract call overhead in future SDK versions.
 
+## `add_to_allowlist` cost vs. allowlist size
+
+**Question** (#95): does adding one address to `allowlist-token` get more
+expensive as the allowlist grows?
+
+**Design expectation**: no. Each entry is its own persistent key,
+`DataKey::Allowed(Address)`. An `add_to_allowlist` call reads the admin from
+instance storage, then writes and extends the TTL of exactly one persistent
+key. It never iterates, counts, or loads the rest of the allowlist, so its
+ledger footprint (and therefore its resource fee) is the same whether 0 or
+1,000,000 addresses are already allowlisted.
+
+**Benchmark**: `contracts/allowlist-token/tests/add_to_allowlist_cost.rs`
+pre-populates the allowlist with **0, 100, and 1,000** unrelated addresses
+(outside the measured window), then resets the budget and measures the CPU
+instructions and memory bytes charged for one further `add_to_allowlist`.
+It prints a table of the absolute costs and the ratio to the empty-allowlist
+cost at each size:
+
+```bash
+cargo test -p allowlist-token --test add_to_allowlist_cost -- --nocapture
+```
+
+**Pass criterion**: the cost at 100 and 1,000 entries must be within **10%**
+of the empty-allowlist cost, the same tolerance as `budget-baselines.toml`.
+The margin exists because the local test host keeps every entry a test has
+touched in one sorted in-memory map, which adds a small O(log n) lookup term
+that isn't there on-chain, where only the transaction's own footprint is
+loaded. Real O(n) growth would be a many-fold increase at 1,000 entries and
+fails the check clearly.
+
+**If it fails**: treat it as a bug and open a follow-up issue with the
+printed table. Don't raise the tolerance to make it pass — it would mean the
+O(1)-per-add assumption no longer holds.
+
 ## Policy-Engine Composition Overhead
 
 The `policy-engine` contract provides a convenience layer for composing multiple compliance checks without having to hand-code the cross-contract calls. However, this composition introduces a small overhead compared to calling the primitives directly.

@@ -93,6 +93,22 @@ data   : { "amount": <i128> }
 > both in topics is intentional and consistent with the spirit of the
 > convention.
 
+#### `AdminTransferred`
+
+Emitted when the admin role changes hands — either immediately via
+`transfer_admin(current_admin, new_admin)`, or when a proposed admin
+completes the two-step `propose_admin` / `accept_admin` flow.
+
+```
+topics : ["admin_transferred", <old_admin: Address>, <new_admin: Address>]
+data   : {}
+```
+
+| Field | Type | Placement | Description |
+|---|---|---|---|
+| `old_admin` | `Address` | topic | Admin before the transfer (loses all privileges immediately) |
+| `new_admin` | `Address` | topic | Admin after the transfer |
+
 ---
 
 ### `denylist-gate`
@@ -126,6 +142,21 @@ data   : {}
 |---|---|---|---|
 | `address` | `Address` | topic | Address removed from the denylist |
 
+#### `AdminTransferred`
+
+Emitted when `transfer_admin(current_admin, new_admin)` reassigns the admin
+role. Takes effect immediately and is not blocked by `pause`.
+
+```
+topics : ["admin_transferred", <old_admin: Address>, <new_admin: Address>]
+data   : {}
+```
+
+| Field | Type | Placement | Description |
+|---|---|---|---|
+| `old_admin` | `Address` | topic | Admin before the transfer (loses all privileges immediately) |
+| `new_admin` | `Address` | topic | Admin after the transfer |
+
 ---
 
 ### `jurisdiction-flag`
@@ -151,6 +182,22 @@ data   : { "code": <String> }
 > then read the code from the data map). Placing `code` in the data map
 > rather than as a topic is therefore intentional and consistent with the
 > topic/data split convention above.
+
+#### `IssuerTransferred`
+
+Emitted when `transfer_issuer(current_issuer, new_issuer)` reassigns the
+issuer role. Takes effect immediately, is not blocked by `pause`, and leaves
+any compliance-officer assignment unchanged.
+
+```
+topics : ["issuer_transferred", <old_issuer: Address>, <new_issuer: Address>]
+data   : {}
+```
+
+| Field | Type | Placement | Description |
+|---|---|---|---|
+| `old_issuer` | `Address` | topic | Issuer before the transfer (loses all privileges immediately) |
+| `new_issuer` | `Address` | topic | Issuer after the transfer |
 
 ---
 

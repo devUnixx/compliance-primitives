@@ -17,9 +17,13 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env,
-    String,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, BytesN,
+    Env, String,
 };
+
+/// On-chain storage schema version, returned by `schema_version`. Bump this
+/// when the storage layout changes (see STORAGE_VERSIONING.md).
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// Extend a persistent allowlist entry when its remaining TTL drops below
 /// this many ledgers (~7 days at ~5s/ledger on mainnet).
@@ -37,6 +41,18 @@ enum DataKey {
     Allowed(Address),
     Paused,
     PendingAdmin,
+    /// A proposed, not-yet-committed upgrade. Instance storage.
+    PendingUpgrade,
+}
+
+/// A pending two-step upgrade recorded by `propose_upgrade`.
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeState {
+    /// Hash of the already-uploaded replacement Wasm.
+    pub new_wasm_hash: BytesN<32>,
+    /// First ledger sequence at which `commit_upgrade` may install it.
+    pub activated_at: u32,
 }
 
 #[contractevent]
@@ -100,6 +116,8 @@ pub enum Error {
     ContractPaused = 5,
     NoPendingAdmin = 6,
     PendingAdminMismatch = 7,
+    /// No upgrade is pending, or its delay has not yet elapsed.
+    UpgradeNotReady = 8,
 }
 
 #[contract]
@@ -195,7 +213,34 @@ impl AllowlistToken {
         Ok(())
     }
 
-    /// Propose a two-step upgrade to `new_wasm` (the replacement contract Wasm).
+    /// Immediately reassign the admin role to `new_admin`. Requires auth from
+    /// `current_admin`, which must be the stored admin.
+    ///
+    /// Unlike `propose_admin` / `accept_admin`, this is single-step: the old
+    /// admin loses all privileges as soon as this call succeeds, and any
+    /// pending two-step proposal is cleared. Prefer the two-step flow when
+    /// `new_admin`'s key has not yet been proven to work; use this one when
+    /// the current key must be rotated out right away.
+    ///
+    /// Emits `AdminTransferred { old_admin, new_admin }`.
+    pub fn transfer_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &current_admin)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        AdminTransferred {
+            old_admin: current_admin,
+            new_admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Propose a two-step upgrade to `new_wasm_hash` (the hash of the
+    /// already-uploaded replacement contract Wasm).
     ///
     /// Admin-only. The upgrade does **not** take effect immediately: it becomes
     /// committable only once the ledger sequence reaches `activated_at`, which
@@ -208,20 +253,20 @@ impl AllowlistToken {
     pub fn propose_upgrade(
         env: Env,
         admin: Address,
-        new_wasm: soroban_sdk::Bytes,
+        new_wasm_hash: BytesN<32>,
         delay_ledgers: u32,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         let state = UpgradeState {
-            new_wasm,
-            activated_at: env.ledger().sequence().saturating_add(delay_ledgers as u64),
+            new_wasm_hash,
+            activated_at: env.ledger().sequence().saturating_add(delay_ledgers),
         };
         env.storage().instance().set(&DataKey::PendingUpgrade, &state);
         env.events().publish((soroban_sdk::symbol_short!("upg_prop"),), (admin, delay_ledgers));
         Ok(())
     }
 
-    /// Commit a previously proposed upgrade, installing `new_wasm`.
+    /// Commit a previously proposed upgrade, installing `new_wasm_hash`.
     ///
     /// Admin-only. Errors with `UpgradeNotReady` if no upgrade is pending or if
     /// the current ledger has not yet reached `activated_at`.
@@ -235,9 +280,9 @@ impl AllowlistToken {
         if env.ledger().sequence() < state.activated_at {
             return Err(Error::UpgradeNotReady);
         }
-        env.deployer().update_current_contract_wasm(state.new_wasm);
+        env.deployer().update_current_contract_wasm(state.new_wasm_hash);
         env.storage().instance().remove(&DataKey::PendingUpgrade);
-        env.events().publish((soroban_sdk::symbol_short!("upg_commit"),), (admin,));
+        env.events().publish((soroban_sdk::symbol_short!("upg_cmt"),), (admin,));
         Ok(())
     }
 
@@ -249,7 +294,7 @@ impl AllowlistToken {
     }
 
     /// Current on-chain schema version (see [`SCHEMA_VERSION`]).
-    pub fn schema_version(env: Env) -> u32 {
+    pub fn schema_version(_env: Env) -> u32 {
         SCHEMA_VERSION
     }
 
