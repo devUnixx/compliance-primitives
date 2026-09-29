@@ -345,8 +345,8 @@ fn test_multisig_add_signer() {
     let signers = vec![&env, admin.clone(), signer1.clone()];
     client.initialize_multisig(&admin, &signers, &2);
 
-    // Add a new signer
-    let result = client.try_add_signer(&new_signer);
+    // Add a new signer (first of two required approvals)
+    let result = client.try_add_signer(&admin, &new_signer);
     assert!(result.is_ok());
 }
 
@@ -369,7 +369,7 @@ fn test_multisig_remove_signer() {
     client.initialize_multisig(&admin, &signers, &2);
 
     // Remove one signer (should still have 2)
-    let result = client.try_remove_signer(&signer2);
+    let result = client.try_remove_signer(&admin, &signer2);
     assert!(result.is_ok());
 }
 
@@ -390,6 +390,148 @@ fn test_multisig_remove_signer_fails_if_only_one() {
     client.initialize_multisig(&admin, &signers, &1);
 
     // Try to remove the only signer (should fail)
-    let result = client.try_remove_signer(&admin);
+    let result = client.try_remove_signer(&admin, &admin);
     assert_eq!(result, Err(Ok(Error::InvalidSignerSet)));
+}
+
+fn setup_multisig<'a>(
+    env: &'a Env,
+    signer_count: u32,
+    threshold: u32,
+) -> (Address, soroban_sdk::Vec<Address>, DenylistGateClient<'a>) {
+    let (admin, _contract_id, client) = setup(env);
+    let mut signers = vec![env, admin.clone()];
+    for _ in 1..signer_count {
+        signers.push_back(Address::generate(env));
+    }
+    client.initialize_multisig(&admin, &signers, &threshold);
+    (admin, signers, client)
+}
+
+#[test]
+fn test_multisig_non_signer_cannot_add_signer() {
+    let env = Env::default();
+    let (_admin, signers, client) = setup_multisig(&env, 2, 1);
+    let outsider = Address::generate(&env);
+    let new_signer = Address::generate(&env);
+
+    let result = client.try_add_signer(&outsider, &new_signer);
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+    assert_eq!(client.signers(), signers);
+}
+
+#[test]
+fn test_multisig_non_signer_cannot_remove_signer() {
+    let env = Env::default();
+    let (_admin, signers, client) = setup_multisig(&env, 2, 1);
+    let outsider = Address::generate(&env);
+    let target = signers.get_unchecked(1);
+
+    let result = client.try_remove_signer(&outsider, &target);
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+    assert_eq!(client.signers(), signers);
+}
+
+#[test]
+fn test_multisig_signer_can_add_and_remove_signer() {
+    let env = Env::default();
+    let (admin, signers, client) = setup_multisig(&env, 2, 1);
+    let new_signer = Address::generate(&env);
+
+    client.add_signer(&admin, &new_signer);
+    assert_eq!(client.signers().len(), 3);
+    assert!(client.signers().iter().any(|s| s == new_signer));
+
+    // The newly added signer is a genuine signer and can act in turn.
+    let original = signers.get_unchecked(1);
+    client.remove_signer(&new_signer, &original);
+    assert_eq!(client.signers().len(), 2);
+    assert!(!client.signers().iter().any(|s| s == original));
+}
+
+#[test]
+fn test_multisig_removed_signer_loses_authority() {
+    let env = Env::default();
+    let (admin, signers, client) = setup_multisig(&env, 3, 1);
+    let removed = signers.get_unchecked(2);
+    client.remove_signer(&admin, &removed);
+
+    let result = client.try_add_signer(&removed, &Address::generate(&env));
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+}
+
+#[test]
+fn test_multisig_change_needs_threshold_distinct_approvals() {
+    let env = Env::default();
+    let (admin, signers, client) = setup_multisig(&env, 3, 2);
+    let other = signers.get_unchecked(1);
+    let new_signer = Address::generate(&env);
+
+    // One signer approving, even repeatedly, never reaches a threshold of 2.
+    client.add_signer(&admin, &new_signer);
+    client.add_signer(&admin, &new_signer);
+    assert_eq!(client.signers().len(), 3);
+
+    // A second distinct signer's approval applies the change.
+    client.add_signer(&other, &new_signer);
+    assert_eq!(client.signers().len(), 4);
+    assert!(client.signers().iter().any(|s| s == new_signer));
+}
+
+#[test]
+fn test_multisig_add_existing_signer_rejected() {
+    let env = Env::default();
+    let (admin, signers, client) = setup_multisig(&env, 2, 1);
+    let existing = signers.get_unchecked(1);
+
+    let result = client.try_add_signer(&admin, &existing);
+    assert_eq!(result, Err(Ok(Error::SignerAlreadyExists)));
+}
+
+#[test]
+fn test_multisig_remove_unknown_signer_rejected() {
+    let env = Env::default();
+    let (admin, _signers, client) = setup_multisig(&env, 2, 1);
+
+    let result = client.try_remove_signer(&admin, &Address::generate(&env));
+    assert_eq!(result, Err(Ok(Error::SignerNotInSet)));
+}
+
+#[test]
+fn test_multisig_remove_below_threshold_rejected() {
+    let env = Env::default();
+    let (admin, signers, client) = setup_multisig(&env, 2, 2);
+    let other = signers.get_unchecked(1);
+
+    let result = client.try_remove_signer(&admin, &other);
+    assert_eq!(result, Err(Ok(Error::InvalidThreshold)));
+}
+
+#[test]
+fn test_signer_changes_require_multisig_to_be_enabled() {
+    let env = Env::default();
+    let (admin, _contract_id, client) = setup(&env);
+
+    let result = client.try_add_signer(&admin, &Address::generate(&env));
+    assert_eq!(result, Err(Ok(Error::MultisigNotEnabled)));
+}
+
+#[test]
+fn test_multisig_initialize_twice_fails() {
+    let env = Env::default();
+    let (admin, signers, client) = setup_multisig(&env, 2, 1);
+
+    let result = client.try_initialize_multisig(&admin, &signers, &1);
+    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+}
+
+#[test]
+fn test_multisig_initialize_rejects_non_admin() {
+    let env = Env::default();
+    let (_admin, _contract_id, client) = setup(&env);
+    let impostor = Address::generate(&env);
+    let signers = vec![&env, impostor.clone()];
+
+    let result = client.try_initialize_multisig(&impostor, &signers, &1);
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
 }

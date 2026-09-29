@@ -18,11 +18,36 @@
 //! **Composition**: this contract is meant to be called into, not deployed
 //! as a token itself. See `/examples/denylist-gate-consumer` for a worked
 //! example of a token contract wiring `check()` into its `transfer` path.
+//!
+//! # Authorization model
+//!
+//! The contract starts in single-admin mode: `admin` (set in `initialize`)
+//! authorizes every denylist mutation via `require_auth()`.
+//!
+//! `initialize_multisig` (admin-only, callable once) additionally installs an
+//! M-of-N signer set. From then on the signer set is governed as follows:
+//!
+//! - `add_signer` and `remove_signer` take the calling `caller` explicitly.
+//!   Each call runs `caller.require_auth()` and then requires `caller` to be in
+//!   the *current* signer set; any other address is rejected with
+//!   `NotAuthorized`.
+//! - A change does not take effect on a single signer's say-so. Each call
+//!   records one approval from `caller` for that exact action (add X / remove
+//!   X). Approvals are per action and de-duplicated per signer, so one signer
+//!   calling twice still counts once. The change is applied, and its pending
+//!   approvals cleared, only once `threshold` distinct current signers have
+//!   approved it.
+//! - Removals are validated before an approval is recorded: the set can never
+//!   shrink to empty, nor below the threshold (`InvalidSignerSet` /
+//!   `InvalidThreshold`).
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env, Vec,
 };
+
+/// On-chain schema version reported by `schema_version`.
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// Batch operations are capped to reduce the chance of a single invocation
 /// exceeding Soroban instruction/resource limits.
@@ -39,6 +64,36 @@ enum DataKey {
     Admin,
     Paused,
     Denied(Address),
+    /// A proposed two-step upgrade awaiting `commit_upgrade`.
+    PendingUpgrade,
+    /// The M-of-N signer set, present once `initialize_multisig` has run.
+    SignerSet,
+    /// Approvals collected so far for one pending signer-set change.
+    PendingSignerAction(SignerAction),
+}
+
+/// A proposed upgrade: the new Wasm hash and the ledger it becomes committable.
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeState {
+    pub new_wasm: BytesN<32>,
+    pub activated_at: u32,
+}
+
+/// The M-of-N signer set.
+#[contracttype]
+#[derive(Clone)]
+pub struct SignerSet {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+}
+
+/// A signer-set change that needs `threshold` distinct approvals to apply.
+#[contracttype]
+#[derive(Clone)]
+pub enum SignerAction {
+    Add(Address),
+    Remove(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +112,30 @@ pub struct DenyRemove {
     pub address: Address,
 }
 
+#[contractevent]
+pub struct MultisigInitialized {
+    pub threshold: u32,
+    pub signer_count: u32,
+}
+
+#[contractevent]
+pub struct SignerApproved {
+    #[topic]
+    pub signer: Address,
+}
+
+#[contractevent]
+pub struct SignerAdded {
+    #[topic]
+    pub signer: Address,
+}
+
+#[contractevent]
+pub struct SignerRemoved {
+    #[topic]
+    pub signer: Address,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -70,6 +149,12 @@ pub enum Error {
     NotAuthorized = 3,
     ContractPaused = 4,
     BatchTooLarge = 5,
+    UpgradeNotReady = 6,
+    InvalidThreshold = 7,
+    InvalidSignerSet = 8,
+    SignerNotInSet = 9,
+    SignerAlreadyExists = 10,
+    MultisigNotEnabled = 11,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,13 +190,13 @@ impl DenylistGate {
     pub fn propose_upgrade(
         env: Env,
         admin: Address,
-        new_wasm: soroban_sdk::Bytes,
+        new_wasm: BytesN<32>,
         delay_ledgers: u32,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         let state = UpgradeState {
             new_wasm,
-            activated_at: env.ledger().sequence().saturating_add(delay_ledgers as u64),
+            activated_at: env.ledger().sequence().saturating_add(delay_ledgers),
         };
         env.storage().instance().set(&DataKey::PendingUpgrade, &state);
         env.events().publish((soroban_sdk::symbol_short!("upg_prop"),), (admin, delay_ledgers));
@@ -134,7 +219,7 @@ impl DenylistGate {
         }
         env.deployer().update_current_contract_wasm(state.new_wasm);
         env.storage().instance().remove(&DataKey::PendingUpgrade);
-        env.events().publish((soroban_sdk::symbol_short!("upg_commit"),), (admin,));
+        env.events().publish((soroban_sdk::symbol_short!("upg_cmt"),), (admin,));
         Ok(())
     }
 
@@ -146,7 +231,7 @@ impl DenylistGate {
     }
 
     /// Current on-chain schema version (see [`SCHEMA_VERSION`]).
-    pub fn schema_version(env: Env) -> u32 {
+    pub fn schema_version(_env: Env) -> u32 {
         SCHEMA_VERSION
     }
 
@@ -232,9 +317,168 @@ impl DenylistGate {
             .unwrap_or(false)
     }
 
+    /// Returns `true` if `address` is on the denylist. Inverse of `check`.
+    pub fn is_denylisted(env: Env, address: Address) -> bool {
+        !Self::check(env, address)
+    }
+
+    /// Install an M-of-N signer set. Admin-only; callable once.
+    ///
+    /// `signers` must be non-empty and free of duplicates, and `threshold`
+    /// must be between 1 and `signers.len()`.
+    pub fn initialize_multisig(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if env.storage().instance().has(&DataKey::SignerSet) {
+            return Err(Error::AlreadyInitialized);
+        }
+        if signers.is_empty() {
+            return Err(Error::InvalidSignerSet);
+        }
+        if threshold == 0 || threshold > signers.len() {
+            return Err(Error::InvalidThreshold);
+        }
+        for (i, signer) in signers.iter().enumerate() {
+            for other in signers.iter().skip(i + 1) {
+                if signer == other {
+                    return Err(Error::InvalidSignerSet);
+                }
+            }
+        }
+
+        let signer_count = signers.len();
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerSet, &SignerSet { signers, threshold });
+        MultisigInitialized {
+            threshold,
+            signer_count,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Approve adding `new_signer` to the signer set. `caller` must authorize
+    /// the call and be in the current signer set. The signer is added once
+    /// `threshold` distinct signers have approved this exact action.
+    pub fn add_signer(env: Env, caller: Address, new_signer: Address) -> Result<(), Error> {
+        let signer_set = Self::require_signer(&env, &caller)?;
+        if Self::contains(&signer_set.signers, &new_signer) {
+            return Err(Error::SignerAlreadyExists);
+        }
+        Self::approve(&env, caller, SignerAction::Add(new_signer), signer_set)
+    }
+
+    /// Approve removing `signer_to_remove` from the signer set. `caller` must
+    /// authorize the call and be in the current signer set. The signer is
+    /// removed once `threshold` distinct signers have approved this exact
+    /// action. The set may never become empty or smaller than the threshold.
+    pub fn remove_signer(
+        env: Env,
+        caller: Address,
+        signer_to_remove: Address,
+    ) -> Result<(), Error> {
+        let signer_set = Self::require_signer(&env, &caller)?;
+        if !Self::contains(&signer_set.signers, &signer_to_remove) {
+            return Err(Error::SignerNotInSet);
+        }
+        if signer_set.signers.len() <= 1 {
+            return Err(Error::InvalidSignerSet);
+        }
+        if signer_set.threshold > signer_set.signers.len() - 1 {
+            return Err(Error::InvalidThreshold);
+        }
+        Self::approve(&env, caller, SignerAction::Remove(signer_to_remove), signer_set)
+    }
+
+    /// The current signer set, or empty when multisig is not enabled.
+    pub fn signers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get::<_, SignerSet>(&DataKey::SignerSet)
+            .map(|set| set.signers)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    fn contains(signers: &Vec<Address>, address: &Address) -> bool {
+        signers.iter().any(|s| s == *address)
+    }
+
+    /// Requires `caller`'s authorization and membership in the current signer
+    /// set; returns that set.
+    fn require_signer(env: &Env, caller: &Address) -> Result<SignerSet, Error> {
+        caller.require_auth();
+        let signer_set: SignerSet = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerSet)
+            .ok_or(Error::MultisigNotEnabled)?;
+        if !Self::contains(&signer_set.signers, caller) {
+            return Err(Error::NotAuthorized);
+        }
+        Ok(signer_set)
+    }
+
+    /// Records `caller`'s approval of `action` and applies it once `threshold`
+    /// distinct signers have approved.
+    fn approve(
+        env: &Env,
+        caller: Address,
+        action: SignerAction,
+        mut signer_set: SignerSet,
+    ) -> Result<(), Error> {
+        let key = DataKey::PendingSignerAction(action.clone());
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if !Self::contains(&approvals, &caller) {
+            approvals.push_back(caller.clone());
+        }
+        SignerApproved { signer: caller }.publish(env);
+
+        // Only approvals from signers still in the set count towards the threshold.
+        let mut valid = 0u32;
+        for approver in approvals.iter() {
+            if Self::contains(&signer_set.signers, &approver) {
+                valid += 1;
+            }
+        }
+        if valid < signer_set.threshold {
+            env.storage().instance().set(&key, &approvals);
+            return Ok(());
+        }
+
+        env.storage().instance().remove(&key);
+        match action {
+            SignerAction::Add(new_signer) => {
+                signer_set.signers.push_back(new_signer.clone());
+                env.storage().instance().set(&DataKey::SignerSet, &signer_set);
+                SignerAdded { signer: new_signer }.publish(env);
+            }
+            SignerAction::Remove(removed) => {
+                let mut remaining = Vec::new(env);
+                for signer in signer_set.signers.iter() {
+                    if signer != removed {
+                        remaining.push_back(signer);
+                    }
+                }
+                signer_set.signers = remaining;
+                env.storage().instance().set(&DataKey::SignerSet, &signer_set);
+                SignerRemoved { signer: removed }.publish(env);
+            }
+        }
+        Ok(())
+    }
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
