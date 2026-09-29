@@ -41,7 +41,7 @@ use soroban_sdk::{contract, contractclient, contracterror, contractimpl, contrac
 
 #[contractclient(name = "FlagClient")]
 pub trait JurisdictionFlagInterface {
-    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> bool;
+    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> Result<bool, u32>;
 }
 
 #[contracttype]
@@ -115,7 +115,9 @@ impl ExampleToken {
             .ok_or(Error::NotInitialized)?;
         let flag = FlagClient::new(&env, &flag_address);
 
-        if !flag.is_permitted_jurisdiction(&from, &allowed_codes) {
+        let permitted = flag.is_permitted_jurisdiction(&from, &allowed_codes)
+            .map_err(|_| Error::JurisdictionNotPermitted)?;
+        if !permitted {
             return Err(Error::JurisdictionNotPermitted);
         }
 

@@ -71,7 +71,7 @@ pub trait DenylistGateInterface {
 /// Must match the actual contract's exported function signature exactly.
 #[soroban_sdk::contractclient(name = "JurisdictionFlagClient")]
 pub trait JurisdictionFlagInterface {
-    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> bool;
+    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> Result<bool, jurisdiction_flag::Error>;
 }
 
 /// Subset of the `circuit-breaker` interface that this aggregator uses.
@@ -132,6 +132,18 @@ pub struct AddressCheckResult {
     pub checks: Vec<CheckResult>,
 }
 
+/// Configuration of this aggregator instance, returned by `get_config`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregatorConfig {
+    /// Address of the `denylist-gate` contract, if configured.
+    pub denylist_gate: Option<Address>,
+    /// Address of the `jurisdiction-flag` contract, if configured.
+    pub jurisdiction_flag: Option<Address>,
+    /// Address of the `circuit-breaker` contract, if configured.
+    pub circuit_breaker: Option<Address>,
+}
+
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
@@ -188,8 +200,9 @@ impl ComplianceAggregator {
     /// Maximum number of addresses accepted by `batch_check` in a single
     /// call. Bounds the per-transaction cross-contract call fan-out (each
     /// address costs up to two nested calls) so a single invocation cannot
-    /// exceed the host's resource budget.
-    pub const MAX_BATCH_SIZE: u32 = 100;
+    /// exceed the host's resource budget. Set to 45 to fit comfortably within
+    /// Soroban's default per-invocation resource limits.
+    pub const MAX_BATCH_SIZE: u32 = 45;
 
     // -----------------------------------------------------------------------
     // Lifecycle
@@ -320,6 +333,16 @@ impl ComplianceAggregator {
         env.storage().instance().get(&DataKey::CircuitBreaker)
     }
 
+    /// Returns the current configuration of this aggregator instance, including
+    /// all registered check contract addresses.
+    pub fn get_config(env: Env) -> AggregatorConfig {
+        AggregatorConfig {
+            denylist_gate: env.storage().instance().get(&DataKey::DenylistGate),
+            jurisdiction_flag: env.storage().instance().get(&DataKey::JurisdictionFlag),
+            circuit_breaker: env.storage().instance().get(&DataKey::CircuitBreaker),
+        }
+    }
+
     /// Returns `true` if a circuit-breaker is configured and it is
     /// currently frozen.
     fn is_frozen(env: &Env) -> bool {
@@ -389,7 +412,7 @@ impl ComplianceAggregator {
             .get::<DataKey, Address>(&DataKey::JurisdictionFlag)
         {
             let client = JurisdictionFlagClient::new(&env, &flag_addr);
-            let passed = client.is_permitted_jurisdiction(&address, &allowed_jurisdictions);
+            let passed = client.is_permitted_jurisdiction(&address, &allowed_jurisdictions)?;
             all_passed = all_passed && passed;
             results.push_back(CheckResult {
                 check: CheckKind::Jurisdiction,
@@ -475,7 +498,7 @@ impl ComplianceAggregator {
             if let Some(ref fa) = flag_addr {
                 let client = JurisdictionFlagClient::new(&env, fa);
                 let passed =
-                    client.is_permitted_jurisdiction(&address, &allowed_jurisdictions);
+                    client.is_permitted_jurisdiction(&address, &allowed_jurisdictions)?;
                 all_passed = all_passed && passed;
                 results.push_back(CheckResult {
                     check: CheckKind::Jurisdiction,
@@ -544,7 +567,7 @@ impl ComplianceAggregator {
             if let Some(ref fa) = flag_addr {
                 let client = JurisdictionFlagClient::new(&env, fa);
                 all_passed =
-                    all_passed && client.is_permitted_jurisdiction(&address, &allowed_jurisdictions);
+                    all_passed && client.is_permitted_jurisdiction(&address, &allowed_jurisdictions)?;
             }
 
             results.push_back(all_passed);

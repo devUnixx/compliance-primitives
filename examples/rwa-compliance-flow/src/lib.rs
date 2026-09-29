@@ -72,7 +72,7 @@ pub trait JurisdictionFlagInterface {
     fn initialize(env: Env, issuer: Address) -> Result<(), soroban_sdk::contracterror::ContractError>;
     fn set_jurisdiction(env: Env, issuer: Address, address: Address, code: String) -> Result<(), soroban_sdk::contracterror::ContractError>;
     fn get_jurisdiction(env: Env, address: Address) -> Option<String>;
-    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: soroban_sdk::Vec<String>) -> bool;
+    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: soroban_sdk::Vec<String>) -> Result<bool, u32>;
     fn is_compliant(env: Env, address: Address) -> bool;
 }
 

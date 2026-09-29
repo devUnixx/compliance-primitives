@@ -64,7 +64,7 @@ pub trait DenylistCheckInterface {
 /// `evaluate`. Same reason as above for avoiding a direct crate dep.
 #[contractclient(name = "JurisdictionCheckClient")]
 pub trait JurisdictionCheckInterface {
-    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> bool;
+    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> Result<bool, jurisdiction_flag::Error>;
 }
 
 /// Describes the `circuit-breaker` contract interface used for cross-contract
@@ -363,11 +363,17 @@ impl PolicyEngine {
                 let mut all_pass = true;
                 for i in 0..checks.len() {
                     let check = checks.get(i).unwrap();
-                    if !Self::run_check(&env, &check, &from)
-                        || !Self::run_check(&env, &check, &to)
-                    {
-                        all_pass = false;
-                        break;
+                    match (Self::run_check(&env, &check, &from), Self::run_check(&env, &check, &to)) {
+                        (Ok(from_pass), Ok(to_pass)) => {
+                            if !from_pass || !to_pass {
+                                all_pass = false;
+                                break;
+                            }
+                        }
+                        _ => {
+                            all_pass = false;
+                            break;
+                        }
                     }
                 }
                 all_pass
@@ -380,11 +386,11 @@ impl PolicyEngine {
                     let mut any_pass = false;
                     for i in 0..checks.len() {
                         let check = checks.get(i).unwrap();
-                        if Self::run_check(&env, &check, &from)
-                            && Self::run_check(&env, &check, &to)
-                        {
-                            any_pass = true;
-                            break;
+                        if let (Ok(from_pass), Ok(to_pass)) = (Self::run_check(&env, &check, &from), Self::run_check(&env, &check, &to)) {
+                            if from_pass && to_pass {
+                                any_pass = true;
+                                break;
+                            }
                         }
                     }
                     any_pass
@@ -461,19 +467,20 @@ impl PolicyEngine {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    fn run_check(env: &Env, check: &CheckKind, address: &Address) -> bool {
+    fn run_check(env: &Env, check: &CheckKind, address: &Address) -> Result<bool, Error> {
         match check {
             CheckKind::Denylist(params) => {
                 let client = DenylistCheckClient::new(env, &params.contract);
-                client.check(address)
+                Ok(client.check(address))
             }
             CheckKind::Jurisdiction(params) => {
                 let client = JurisdictionCheckClient::new(env, &params.contract);
                 client.is_permitted_jurisdiction(address, &params.allowed_codes)
+                    .map_err(|_| Error::CheckFailed)
             }
             CheckKind::Allowlist(params) => {
                 let client = AllowlistCheckClient::new(env, &params.contract);
-                client.is_allowed(address)
+                Ok(client.is_allowed(address))
             }
         }
     }

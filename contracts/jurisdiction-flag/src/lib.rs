@@ -33,6 +33,8 @@ enum DataKey {
     Issuer,
     ComplianceOfficer,
     Jurisdiction(Address),
+    /// Optional expiry ledger for `Jurisdiction(Address)`. Absent = never expires.
+    ValidUntil(Address),
     Paused,
 }
 
@@ -42,6 +44,13 @@ pub struct JurisdictionSet {
     #[topic]
     pub address: Address,
     pub code: String,
+}
+
+/// Emitted when a read encounters a flag whose `valid_until` has passed.
+#[contractevent]
+pub struct JurisdictionExpired {
+    #[topic]
+    pub address: Address,
 }
 
 #[contractevent]
@@ -72,6 +81,8 @@ pub enum Error {
     /// Caller supplied an argument that is structurally invalid.
     InvalidInput = 4,
     ContractPaused = 5,
+    /// The `allowed_codes` list passed to `is_permitted_jurisdiction` was empty.
+    EmptyAllowedCodes = 6,
 }
 
 #[contract]
@@ -147,12 +158,37 @@ impl JurisdictionFlag {
         let key = DataKey::Jurisdiction(address.clone());
         env.storage().persistent().set(&key, &code);
         Self::extend_jurisdiction_ttl(&env, &key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ValidUntil(address.clone()));
 
         JurisdictionSet {
             address,
             code,
         }
         .publish(&env);
+        Ok(())
+    }
+
+    /// Attach jurisdiction `code` to `address`, valid through ledger
+    /// `valid_until` (inclusive). Issuer or compliance-officer.
+    pub fn set_jurisdiction_until(
+        env: Env,
+        issuer: Address,
+        address: Address,
+        code: String,
+        valid_until: u32,
+    ) -> Result<(), Error> {
+        Self::require_compliance_authority(&env, &issuer)?;
+
+        let key = DataKey::Jurisdiction(address.clone());
+        env.storage().persistent().set(&key, &code);
+        Self::extend_jurisdiction_ttl(&env, &key);
+        let until_key = DataKey::ValidUntil(address.clone());
+        env.storage().persistent().set(&until_key, &valid_until);
+        Self::extend_jurisdiction_ttl(&env, &until_key);
+
+        JurisdictionSet { address, code }.publish(&env);
         Ok(())
     }
 
@@ -167,16 +203,31 @@ impl JurisdictionFlag {
             env.storage()
                 .persistent()
                 .remove(&DataKey::Jurisdiction(address.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ValidUntil(address.clone()));
             JurisdictionRemoved { address }.publish(&env);
         }
         Ok(())
     }
 
     /// Returns the jurisdiction code attached to `address`, if any.
+    ///
+    /// Returns `None` if the flag has a `valid_until` that is strictly less
+    /// than the current ledger sequence, publishing `JurisdictionExpired`.
     pub fn get_jurisdiction(env: Env, address: Address) -> Option<String> {
-        let key = DataKey::Jurisdiction(address);
+        let key = DataKey::Jurisdiction(address.clone());
         let code: Option<String> = env.storage().persistent().get(&key);
         if code.is_some() {
+            let until_key = DataKey::ValidUntil(address.clone());
+            let valid_until: Option<u32> = env.storage().persistent().get(&until_key);
+            if let Some(valid_until) = valid_until {
+                if valid_until < env.ledger().sequence() {
+                    JurisdictionExpired { address }.publish(&env);
+                    return None;
+                }
+                Self::extend_jurisdiction_ttl(&env, &until_key);
+            }
             Self::extend_jurisdiction_ttl(&env, &key);
         }
         code
@@ -185,14 +236,19 @@ impl JurisdictionFlag {
     /// Returns `true` if `address` has a jurisdiction code that appears in
     /// `allowed_codes`. Meant to be called by other contracts enforcing a
     /// permitted-jurisdiction policy.
+    ///
+    /// Returns `Err(Error::EmptyAllowedCodes)` if the `allowed_codes` list is empty.
     pub fn is_permitted_jurisdiction(
         env: Env,
         address: Address,
         allowed_codes: Vec<String>,
-    ) -> bool {
+    ) -> Result<bool, Error> {
+        if allowed_codes.is_empty() {
+            return Err(Error::EmptyAllowedCodes);
+        }
         match Self::get_jurisdiction(env, address) {
-            Some(code) => allowed_codes.iter().any(|c| c == code),
-            None => false,
+            Some(code) => Ok(allowed_codes.iter().any(|c| c == code)),
+            None => Ok(false),
         }
     }
 

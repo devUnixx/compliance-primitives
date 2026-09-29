@@ -56,7 +56,7 @@ pub trait DenylistGateInterface {
 
 #[contractclient(name = "JurisdictionClient")]
 pub trait JurisdictionFlagInterface {
-    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> bool;
+    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> Result<bool, u32>;
 }
 
 #[contracttype]
@@ -161,9 +161,11 @@ impl RwaToken {
         }
 
         let jurisdiction = JurisdictionClient::new(&env, &jurisdiction_addr);
-        if !jurisdiction.is_permitted_jurisdiction(&from, &allowed_codes)
-            || !jurisdiction.is_permitted_jurisdiction(&to, &allowed_codes)
-        {
+        let from_permitted = jurisdiction.is_permitted_jurisdiction(&from, &allowed_codes)
+            .map_err(|_| Error::JurisdictionNotPermitted)?;
+        let to_permitted = jurisdiction.is_permitted_jurisdiction(&to, &allowed_codes)
+            .map_err(|_| Error::JurisdictionNotPermitted)?;
+        if !from_permitted || !to_permitted {
             return Err(Error::JurisdictionNotPermitted);
         }
 
