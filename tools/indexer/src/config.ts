@@ -13,6 +13,8 @@ export interface Config {
   policyEngineContractId: string;
   /** Contract ID of the deployed circuit-breaker contract (or empty to skip) */
   circuitBreakerContractId: string;
+  /** Contract ID of the deployed audit-log contract (or empty to skip) */
+  auditLogContractId: string;
   dbPath: string;
   pollIntervalMs: number;
   startLedger: number;
@@ -30,6 +32,7 @@ const CONTRACT_ID_ENV_VARS = [
   "AGGREGATOR_CONTRACT_ID",
   "POLICY_ENGINE_CONTRACT_ID",
   "CIRCUIT_BREAKER_CONTRACT_ID",
+  "AUDIT_LOG_CONTRACT_ID",
 ] as const;
 
 function required(name: string, env: NodeJS.ProcessEnv): string {
@@ -82,6 +85,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     aggregatorContractId: env.AGGREGATOR_CONTRACT_ID?.trim() || "",
     policyEngineContractId: env.POLICY_ENGINE_CONTRACT_ID?.trim() || "",
     circuitBreakerContractId: env.CIRCUIT_BREAKER_CONTRACT_ID?.trim() || "",
+    auditLogContractId: env.AUDIT_LOG_CONTRACT_ID?.trim() || "",
     dbPath: required("DB_PATH", env),
     pollIntervalMs: positiveInteger("POLL_INTERVAL_MS", env.POLL_INTERVAL_MS, 5000),
     startLedger,

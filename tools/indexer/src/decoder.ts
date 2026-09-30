@@ -16,8 +16,8 @@
  *   DenyAdd         topics: [Symbol("DenyAdd"), Address]            data: Void
  *   DenyRemove      topics: [Symbol("DenyRemove"), Address]         data: Void
  *   JurisdictionSet topics: [Symbol("JurisdictionSet"), Address]    data: String(code)
- *   Frozen          topics: [Symbol("Frozen"), Address]             data: Void
- *   Unfrozen        topics: [Symbol("Unfrozen"), Address]           data: Void
+ *   Frozen          topics: [Symbol("Frozen"), Address(admin)]       data: Void
+ *   Unfrozen        topics: [Symbol("Unfrozen"), Address(admin)]     data: Void
  *
  * For policy-engine:
  *
@@ -314,8 +314,6 @@ const KNOWN_EVENTS = new Set([
   "DenyAdd",
   "DenyRemove",
   "JurisdictionSet",
-  "Frozen",
-  "Unfrozen",
   "SignerAdd",
   "SignerRm",
   "ThreshSet",
@@ -324,6 +322,10 @@ const KNOWN_EVENTS = new Set([
   "AdminSet",
   "DenylistGateSet",
   "JurisdictionFlagSet",
+  // Note: Frozen/Unfrozen are circuit-breaker events handled separately below
+  // because their topic[1] carries the admin address but the stored event
+  // intentionally leaves `address` null — the contract_id column identifies
+  // which breaker changed state.
 ]);
 
 export function decodeEvent(
@@ -420,6 +422,20 @@ export function decodeEvent(
     const nameVal = topics[0];
     if (nameVal.type !== "Symbol") return null;
     const eventType = nameVal.value;
+
+    // ── circuit-breaker state-change events ───────────────────────────────────
+    //
+    // Frozen / Unfrozen:
+    //   topics: [Symbol("Frozen"|"Unfrozen"), Address(admin)]
+    //   data:   Void
+    //
+    // topic[1] carries the admin address that triggered the change, but we
+    // intentionally store address as null — the contract_id column identifies
+    // which breaker instance changed state, which is the useful lookup key.
+    if (eventType === "Frozen" || eventType === "Unfrozen") {
+      return { ...base, eventType, address: null };
+    }
+
     if (!KNOWN_EVENTS.has(eventType)) return null;
 
     if (eventType === "PolicyResult") {
@@ -465,15 +481,6 @@ export function decodeEvent(
       const address = topics[1];
       if (address?.type !== "Address") return null;
       return { ...base, eventType, address: address.value };
-    }
-
-    if (eventType === "Frozen" || eventType === "Unfrozen") {
-      const admin = topics[1];
-      return {
-        ...base,
-        eventType,
-        address: admin?.type === "Address" ? admin.value : null,
-      };
     }
 
     // topics[1] is always the primary address
