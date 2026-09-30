@@ -31,6 +31,45 @@
 //! | `Paused`        | `bool`       | instance | set by [`pause`] / [`unpause`]         |
 //! | `PausedSince`   | `u64`        | instance | set by [`pause`] / cleared by [`unpause`] |
 //! | `PauseReason`   | `String`     | instance | set by [`pause_with_reason`] / cleared by [`unpause`] |
+//!
+//! ## Which contracts use this crate vs. a local pause implementation
+//!
+//! Not every contract in the workspace delegates pause state to this crate.
+//! A reader of this file would otherwise need to grep the workspace to find
+//! out who depends on it — the table below captures that for each primitive.
+//!
+//! | Contract | Pause mechanism | Notes |
+//! |---|---|---|
+//! | `multisig-admin` | **this crate** (`compliance_pausable::*`) | Added when the crate was introduced |
+//! | `compliance-aggregator` | **this crate** (`compliance_pausable::*`) | Added when the crate was introduced |
+//! | `audit-log` | **this crate** (`compliance_pausable::*`) | Added when the crate was introduced |
+//! | `policy-engine` | **this crate** (`compliance_pausable::*`) | Added when the crate was introduced |
+//! | `allowlist-token` | **local** `DataKey::Paused` (inline) | Predates the shared crate; not yet migrated |
+//! | `denylist-gate` | **local** `DataKey::Paused` (inline) | Predates the shared crate; not yet migrated |
+//! | `jurisdiction-flag` | **local** `DataKey::Paused` (inline) | Predates the shared crate; not yet migrated |
+//! | `circuit-breaker` | **not applicable** — uses `DataKey::Frozen` | Freeze semantics differ from pause: `Frozen` is a cross-contract gate, not an admin stop |
+//!
+//! ### Why the three original primitives use local pause state
+//!
+//! `allowlist-token`, `denylist-gate`, and `jurisdiction-flag` were written
+//! before `compliance-pausable` existed. Each inlines its own
+//! `env.storage().instance().set(&DataKey::Paused, &true/false)` logic —
+//! functionally identical to what this crate does, but not going through it.
+//! Migrating them is safe (the storage key and semantics are the same) but
+//! requires a coordinated change across three contracts plus their test
+//! suites; it has been left for a dedicated refactor rather than mixed into
+//! unrelated PRs.
+//!
+//! ### Why `circuit-breaker` is different
+//!
+//! `circuit-breaker` uses `DataKey::Frozen` rather than `DataKey::Paused`
+//! and exposes `freeze`/`unfreeze`/`is_frozen` rather than
+//! `pause`/`unpause`/`is_paused`. This is intentional: freeze is a
+//! *cross-contract emergency gate* that other contracts poll before allowing
+//! a transfer — it is not the same concept as an admin pause on the
+//! circuit-breaker contract itself. The two mechanisms are kept separate to
+//! avoid conflating operational pause (admin maintenance window) with
+//! emergency freeze (halt-all-transfers signal).
 #![no_std]
 
 use soroban_sdk::{contracttype, Env, String};
@@ -172,14 +211,15 @@ pub fn require_not_paused_or<E>(env: &Env, err: E) -> Result<(), E> {
 
 /// Panic with a descriptive message if the contract is **not** currently paused.
 ///
-/// Use this at the top of emergency-only recovery functions that should be
-/// callable **only while the contract is paused** — the inverse of
-/// [`require_not_paused`].
+/// This is the inverse of [`require_not_paused`] and is intended for
+/// emergency-only recovery functions that should only be callable *while the
+/// contract is paused* — for example, an admin drain or state-reset that must
+/// be guarded against accidental invocation during normal operation.
 ///
 /// # Example
 ///
 /// ```ignore
-/// /// Emergency drain, only callable while the contract is paused.
+/// /// Emergency drain — only callable while the contract is paused.
 /// pub fn emergency_recover(env: Env, admin: Address) -> Result<(), Error> {
 ///     pausable::require_paused(&env);
 ///     // ... recovery logic ...
@@ -194,8 +234,8 @@ pub fn require_paused(env: &Env) {
 /// Returns `Err(err)` if the contract is **not** currently paused, `Ok(())`
 /// otherwise.
 ///
-/// Use this in entry points that surface the "not paused" condition as a
-/// typed contract error rather than panicking:
+/// Use this in entry points that expose the "not paused" condition as a typed
+/// contract error rather than panicking:
 ///
 /// ```ignore
 /// pub fn emergency_recover(env: Env) -> Result<(), Error> {
