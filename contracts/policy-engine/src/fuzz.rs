@@ -250,6 +250,8 @@ fn evaluate_model(
                 inner.allowed_codes.iter().any(|code| code.to_string() == code_str)
             }
             CheckKind::Allowlist(_) => true,
+            // The fuzz harness never registers circuit-breaker checks.
+            CheckKind::CircuitBreaker(_) => true,
         }
     };
 

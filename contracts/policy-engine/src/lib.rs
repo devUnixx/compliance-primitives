@@ -166,6 +166,22 @@ pub struct AllowlistCheck {
     pub contract: Address,
 }
 
+/// Parameters for a circuit-breaker check.
+///
+/// When this check is evaluated, the engine calls `is_frozen()` on the
+/// configured circuit-breaker contract. The check **passes** only when the
+/// circuit-breaker is **not** frozen (i.e. the emergency stop has not been
+/// triggered). This lets an issuer compose an explicit "is the system
+/// live?" gate alongside denylist and jurisdiction rules inside a single
+/// policy tree, rather than relying solely on the top-level circuit-breaker
+/// short-circuit in `evaluate`.
+#[contracttype]
+#[derive(Clone)]
+pub struct CircuitBreakerCheck {
+    /// Address of the deployed `circuit-breaker` contract to call.
+    pub contract: Address,
+}
+
 /// Describes a single compliance check the engine should perform.
 ///
 /// Each variant carries the address of the external contract that implements
@@ -225,6 +241,11 @@ pub enum CheckKind {
     /// Call `allowlist-token.is_allowed(address)`. The address must be
     /// present on the allowlist for this check to pass.
     Allowlist(AllowlistCheck),
+    /// Call `circuit-breaker.is_frozen()`. The check passes only when the
+    /// circuit-breaker is **not** frozen. Use this to embed an emergency-stop
+    /// gate directly in the policy tree so a single call to `evaluate`
+    /// covers the full compliance stack including the freeze check.
+    CircuitBreaker(CircuitBreakerCheck),
 }
 
 /// How the engine combines the results of multiple checks.
@@ -246,14 +267,6 @@ pub enum CombineOp {
 pub struct AddressPair {
     pub from: Address,
     pub to: Address,
-}
-
-/// Snapshot of the configured policy tree for inspection and auditing.
-#[contracttype]
-#[derive(Clone)]
-pub struct PolicyNode {
-    pub op: CombineOp,
-    pub checks: Vec<CheckKind>,
 }
 
 #[contracttype]
@@ -298,6 +311,8 @@ pub enum Error {
     IndexOutOfBounds = 6,
     /// Returned by state-changing entry points while the contract is paused.
     ContractPaused = 7,
+    /// Returned by `get_check` when the requested index is out of range.
+    CheckIndexOutOfRange = 8,
 }
 
 /// Maximum number of checks that can be registered in a single policy
@@ -342,6 +357,20 @@ pub struct UpgradePerformed {
 pub struct CheckFailure {
     pub check_index: u32,
     pub kind: Symbol,
+}
+
+/// A snapshot of the full policy configuration: the combination operator and
+/// the ordered list of registered checks.
+///
+/// Returned by [`PolicyEngine::get_policy`] so off-chain tooling and auditors
+/// can read back the complete policy in a single view call.
+#[contracttype]
+#[derive(Clone)]
+pub struct PolicyNode {
+    /// How check results are combined (`All` = AND, `Any` = OR).
+    pub op: CombineOp,
+    /// The ordered list of checks that `evaluate` will run.
+    pub checks: Vec<CheckKind>,
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +670,14 @@ impl PolicyEngine {
             CheckKind::Allowlist(params) => {
                 let client = AllowlistCheckClient::new(env, &params.contract);
                 client.is_allowed(address)
+            }
+            CheckKind::CircuitBreaker(params) => {
+                // The circuit-breaker check is address-independent: it reflects
+                // the global freeze state of the system. The check passes only
+                // when the breaker is NOT frozen.
+                let _ = address; // address not used for this check kind
+                let client = CircuitBreakerClient::new(env, &params.contract);
+                !client.is_frozen()
             }
         }
     }

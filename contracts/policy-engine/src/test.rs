@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_utils::{
-    MockDenylist, MockDenylistClient, MockJurisdiction, MockJurisdictionClient,
+    MockCircuitBreaker, MockCircuitBreakerClient, MockDenylist, MockDenylistClient,
+    MockJurisdiction, MockJurisdictionClient,
 };
 use circuit_breaker::{CircuitBreaker, CircuitBreakerClient as CbClient};
 use denylist_gate::{DenylistGate, DenylistGateClient};
@@ -458,4 +459,202 @@ fn test_write_extends_instance_ttl_past_original_expiry() {
     client.set_circuit_breaker(&admin, &breaker);
     assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
     assert_eq!(client.circuit_breaker(), Some(breaker));
+}
+
+// ---------------------------------------------------------------------------
+// Tests for issue #403: CircuitBreaker check kind
+// ---------------------------------------------------------------------------
+
+/// Registers a mock circuit-breaker contract, returns its address.
+fn setup_circuit_breaker(env: &Env) -> Address {
+    env.register(MockCircuitBreaker, ())
+}
+
+/// Policy with all three check kinds under `CombineOp::All`: denylist passes,
+/// jurisdiction passes, circuit-breaker is not frozen → `evaluate` returns true.
+#[test]
+fn test_all_three_check_kinds_all_pass() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+    let cb_id = setup_circuit_breaker(&env);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // Both addresses have valid jurisdiction codes; circuit-breaker is not frozen.
+    let code_us = String::from_str(&env, "US");
+    MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&from, &code_us);
+    MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&to, &code_us);
+    // MockCircuitBreaker starts unfrozen by default.
+
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::CircuitBreaker(CircuitBreakerCheck {
+            contract: cb_id.clone(),
+        }),
+    );
+
+    let result = client.evaluate(&from, &to);
+    assert!(result, "expected all-pass with three check kinds (All)");
+}
+
+/// Policy with all three check kinds under `CombineOp::All`: circuit-breaker
+/// is frozen → the circuit-breaker check fails → `evaluate` returns false.
+#[test]
+fn test_circuit_breaker_check_kind_frozen_fails_all() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+    let cb_id = setup_circuit_breaker(&env);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // Both addresses clear denylist and jurisdiction.
+    let code_us = String::from_str(&env, "US");
+    MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&from, &code_us);
+    MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&to, &code_us);
+
+    // Freeze the circuit-breaker — this check should fail.
+    MockCircuitBreakerClient::new(&env, &cb_id).freeze();
+
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::CircuitBreaker(CircuitBreakerCheck {
+            contract: cb_id.clone(),
+        }),
+    );
+
+    let result = client.evaluate(&from, &to);
+    assert!(!result, "expected false when circuit-breaker is frozen (All)");
+}
+
+/// Policy with all three check kinds under `CombineOp::Any`: denylist and
+/// jurisdiction both fail but circuit-breaker is not frozen → circuit-breaker
+/// check passes for both parties → `evaluate` returns true.
+#[test]
+fn test_circuit_breaker_check_kind_passes_any_semantics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+    let cb_id = setup_circuit_breaker(&env);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // Both addresses are denied (denylist check fails).
+    MockDenylistClient::new(&env, &deny_id).add_to_denylist(&from);
+    MockDenylistClient::new(&env, &deny_id).add_to_denylist(&to);
+    // No jurisdiction codes set (jurisdiction check fails).
+    // Circuit-breaker is not frozen (circuit-breaker check passes).
+
+    let (admin, _engine_id, client) = setup_engine_any(&env);
+
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::CircuitBreaker(CircuitBreakerCheck {
+            contract: cb_id.clone(),
+        }),
+    );
+
+    // With Any: circuit-breaker passes for both → result is true.
+    let result = client.evaluate(&from, &to);
+    assert!(result, "expected true: circuit-breaker passes under Any semantics");
+}
+
+/// Policy with all three check kinds under `CombineOp::Any`: all three checks
+/// fail → `evaluate` returns false.
+#[test]
+fn test_all_three_check_kinds_all_fail_any() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+    let cb_id = setup_circuit_breaker(&env);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // Denylist check fails: both denied.
+    MockDenylistClient::new(&env, &deny_id).add_to_denylist(&from);
+    MockDenylistClient::new(&env, &deny_id).add_to_denylist(&to);
+    // Jurisdiction check fails: no codes set.
+    // Circuit-breaker check fails: frozen.
+    MockCircuitBreakerClient::new(&env, &cb_id).freeze();
+
+    let (admin, _engine_id, client) = setup_engine_any(&env);
+
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::CircuitBreaker(CircuitBreakerCheck {
+            contract: cb_id.clone(),
+        }),
+    );
+
+    let result = client.evaluate(&from, &to);
+    assert!(!result, "expected false when all three checks fail under Any");
 }
