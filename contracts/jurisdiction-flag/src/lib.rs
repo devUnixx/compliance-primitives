@@ -302,6 +302,24 @@ impl JurisdictionFlag {
             .any(|allowed| codes.iter().any(|code| code == allowed))
     }
 
+    /// Unified compliance check — returns `true` if `address` has **any**
+    /// jurisdiction code set, i.e. it has been through an onboarding/KYC
+    /// process that assigned it a jurisdiction.
+    ///
+    /// This entry point implements the shared `ComplianceCheck` interface
+    /// (`is_compliant(address) -> bool`).  Unlike [`is_permitted_jurisdiction`],
+    /// it does not validate the code against a permitted-jurisdictions list
+    /// because the `ComplianceCheck` interface carries only `address`.
+    ///
+    /// Use [`is_permitted_jurisdiction`] when you need to enforce a specific
+    /// set of allowed codes.  Use `is_compliant` for the lighter check of
+    /// "has this address been assigned a jurisdiction at all".
+    ///
+    /// Not affected by pause state — reads always succeed.
+    pub fn is_compliant(env: Env, address: Address) -> bool {
+        Self::get_jurisdiction(env, address).is_some()
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------

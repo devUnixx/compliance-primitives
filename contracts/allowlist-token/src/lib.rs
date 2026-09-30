@@ -332,6 +332,18 @@ impl AllowlistToken {
         env.storage().persistent().get(&DataKey::Allowed(address))
     }
 
+    /// Unified compliance check — returns `true` if `address` is on the
+    /// allowlist, identical to calling [`is_allowed`].
+    ///
+    /// This entry point implements the shared `ComplianceCheck` interface
+    /// (`is_compliant(address) -> bool`) so external contracts can call any
+    /// of the three compliance primitives through the same pattern.
+    ///
+    /// Not affected by pause state — reads always succeed.
+    pub fn is_compliant(env: Env, address: Address) -> bool {
+        Self::is_allowed(env, address)
+    }
+
     /// Pause all mutating operations. Admin-only.
     pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
