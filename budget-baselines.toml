@@ -6,6 +6,14 @@ memory = 1
 cpu = 1
 memory = 1
 
+[denylist-gate.add_to_denylist_without_audit_log]
+cpu = 1
+memory = 1
+
+[denylist-gate.add_to_denylist_with_audit_log]
+cpu = 1
+memory = 1
+
 [jurisdiction-flag.is_permitted_jurisdiction]
 cpu = 1
 memory = 1
@@ -13,3 +21,12 @@ memory = 1
 [policy-engine.evaluate]
 cpu = 1
 memory = 1
+
+# multisig-admin's hottest entrypoint: `__check_auth` runs on every admin
+# operation of every primitive that uses the multisig as its admin.
+# Measured with a 2-of-3 signer set and two approving signatures
+# (`test_budget_regression_multisig_check_auth`). CI fails if either value
+# regresses by more than 10%.
+[multisig-admin.__check_auth]
+cpu = 250000
+memory = 40000

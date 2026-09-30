@@ -140,7 +140,7 @@ fn test_allowlist_token_is_compliant_when_allowlisted() {
     let s = setup(&env);
 
     let alice = Address::generate(&env);
-    s.allowlist.add_to_allowlist(&s.allowlist_admin, &alice);
+    s.allowlist.add_to_allowlist(&s.allowlist_admin, &alice, &None);
 
     assert_compliant_allowlist(&s.allowlist, &alice);
 }
@@ -163,7 +163,7 @@ fn test_allowlist_token_is_not_compliant_after_removal() {
     let s = setup(&env);
 
     let alice = Address::generate(&env);
-    s.allowlist.add_to_allowlist(&s.allowlist_admin, &alice);
+    s.allowlist.add_to_allowlist(&s.allowlist_admin, &alice, &None);
     assert_compliant_allowlist(&s.allowlist, &alice);
 
     s.allowlist.remove_from_allowlist(&s.allowlist_admin, &alice);
@@ -254,7 +254,7 @@ fn test_all_three_contracts_implement_is_compliant_polymorphically() {
     let us_code = String::from_str(&env, "US");
 
     // Set alice up as compliant in all three
-    s.allowlist.add_to_allowlist(&s.allowlist_admin, &alice);
+    s.allowlist.add_to_allowlist(&s.allowlist_admin, &alice, &None);
     s.jurisdiction.set_jurisdiction(&s.issuer, &alice, &us_code);
     // denylist: alice is not denied by default
 

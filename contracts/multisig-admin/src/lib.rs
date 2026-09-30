@@ -43,13 +43,31 @@
 //! through the multisig: they call `env.current_contract_address().require_auth()`
 //! which re-enters `__check_auth`, ensuring no single signer can unilaterally
 //! change the policy.
+//!
+//! ## Upgradeability
+//!
+//! `upgrade(new_wasm_hash)` moves the contract's code to a new WASM hash via
+//! `env.deployer().update_current_contract_wasm`, following the same
+//! admin-gated pattern as `jurisdiction-flag::upgrade` and
+//! `policy-engine::upgrade`. Because this contract *is* the admin, the gate is
+//! `env.current_contract_address().require_auth()` — the upgrade must be
+//! approved by the current M-of-N signer threshold through `__check_auth`,
+//! exactly like `add_signer` / `update_threshold`.
+//!
+//! The WASM swap does not touch storage: the signer set, threshold, pending
+//! proposals and the next proposal ID are all preserved, and the contract
+//! address is unchanged, so every primitive that uses this contract as its
+//! admin keeps working without reconfiguration. An `Upgraded` event carrying
+//! the new WASM hash is emitted for auditability. If a future version changes
+//! the storage layout it must ship a migration entrypoint, per
+//! `STORAGE_VERSIONING.md`.
 #![no_std]
 
 use soroban_sdk::{
     auth::{Context, CustomAccountInterface},
     contract, contracterror, contractevent, contractimpl, contracttype,
     crypto::Hash,
-    Address, Env, Vec,
+    Address, BytesN, Env, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,7 +75,7 @@ use soroban_sdk::{
 // ---------------------------------------------------------------------------
 
 mod events {
-    use soroban_sdk::{symbol_short, Address, Env};
+    use soroban_sdk::{symbol_short, Address, BytesN, Env};
 
     /// Emitted when a new signer is added to the set.
     ///
@@ -94,6 +112,15 @@ mod events {
     pub fn auth_approved(env: &Env, valid_count: u32, threshold: u32) {
         env.events()
             .publish((symbol_short!("AuthOk"),), (valid_count, threshold));
+    }
+
+    /// Emitted when the contract WASM is upgraded.
+    ///
+    /// topics : [Symbol("Upgraded")]
+    /// data   : BytesN<32> (new WASM hash)
+    pub fn upgraded(env: &Env, new_wasm_hash: &BytesN<32>) {
+        env.events()
+            .publish((symbol_short!("Upgraded"),), new_wasm_hash.clone());
     }
 }
 
@@ -203,6 +230,23 @@ impl MultisigAdmin {
     /// Check if the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
         compliance_pausable::is_paused(&env)
+    }
+
+    /// Upgrade the contract WASM to `new_wasm_hash`. Requires the current
+    /// M-of-N threshold (the call goes through `__check_auth`).
+    ///
+    /// All storage — signers, threshold and proposals — is preserved across
+    /// the upgrade and the contract address does not change. The new WASM
+    /// must already be uploaded to the network.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        env.current_contract_address().require_auth();
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        events::upgraded(&env, &new_wasm_hash);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

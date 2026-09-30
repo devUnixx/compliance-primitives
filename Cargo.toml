@@ -15,6 +15,7 @@ members = [
     "examples/denylist-gate-sep41",
     "examples/jurisdiction-denylist-consumer",
     "examples/compliance-integration-flow",
+    "crates/test-trace",
 ]
 
 [workspace.package]
