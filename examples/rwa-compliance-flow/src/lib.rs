@@ -93,6 +93,10 @@ use soroban_sdk::contractclient;
 /// **Renamed from `ComplianceCheckInterface`** (issue #414) to make the
 /// cross-contract / runtime nature explicit and reduce confusion with
 /// `ComplianceCheck`.
+///
+/// `is_compliant` is declared only on this trait, so a client call resolves to
+/// a single method; the interface traits below cover the primitive-specific
+/// methods only.
 #[contractclient(name = "CrossContractComplianceCheckClient")]
 pub trait CrossContractComplianceCheck {
     fn is_compliant(env: Env, address: Address) -> bool;
@@ -105,11 +109,10 @@ pub trait CrossContractComplianceCheck {
 /// Soroban test harness.
 #[contractclient(name = "AllowlistTokenClient")]
 pub trait AllowlistTokenInterface {
-    fn initialize(env: Env, admin: Address, token: Address) -> Result<(), soroban_sdk::contracterror::ContractError>;
-    fn add_to_allowlist(env: Env, admin: Address, address: Address, expiration_ledger: Option<u32>) -> Result<(), soroban_sdk::contracterror::ContractError>;
-    fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), soroban_sdk::contracterror::ContractError>;
+    fn initialize(env: Env, admin: Address, token: Address);
+    fn add_to_allowlist(env: Env, admin: Address, address: Address, expiration_ledger: Option<u32>);
+    fn remove_from_allowlist(env: Env, admin: Address, address: Address);
     fn is_allowed(env: Env, address: Address) -> bool;
-    fn is_compliant(env: Env, address: Address) -> bool;
 }
 
 /// `#[contractclient]`-backed interface for the `denylist-gate` contract.
@@ -119,11 +122,10 @@ pub trait AllowlistTokenInterface {
 /// Soroban test harness.
 #[contractclient(name = "DenylistGateClient")]
 pub trait DenylistGateInterface {
-    fn initialize(env: Env, admin: Address) -> Result<(), soroban_sdk::contracterror::ContractError>;
-    fn add_to_denylist(env: Env, admin: Address, address: Address) -> Result<(), soroban_sdk::contracterror::ContractError>;
-    fn remove_from_denylist(env: Env, admin: Address, address: Address) -> Result<(), soroban_sdk::contracterror::ContractError>;
+    fn initialize(env: Env, admin: Address);
+    fn add_to_denylist(env: Env, admin: Address, address: Address);
+    fn remove_from_denylist(env: Env, admin: Address, address: Address);
     fn check(env: Env, address: Address) -> bool;
-    fn is_compliant(env: Env, address: Address) -> bool;
 }
 
 /// `#[contractclient]`-backed interface for the `jurisdiction-flag` contract.
@@ -133,11 +135,10 @@ pub trait DenylistGateInterface {
 /// Soroban test harness.
 #[contractclient(name = "JurisdictionFlagClient")]
 pub trait JurisdictionFlagInterface {
-    fn initialize(env: Env, issuer: Address) -> Result<(), soroban_sdk::contracterror::ContractError>;
-    fn set_jurisdiction(env: Env, issuer: Address, address: Address, code: String) -> Result<(), soroban_sdk::contracterror::ContractError>;
+    fn initialize(env: Env, issuer: Address);
+    fn set_jurisdiction(env: Env, issuer: Address, address: Address, code: String);
     fn get_jurisdiction(env: Env, address: Address) -> Option<String>;
     fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: soroban_sdk::Vec<String>) -> bool;
-    fn is_compliant(env: Env, address: Address) -> bool;
 }
 
 #[cfg(test)]

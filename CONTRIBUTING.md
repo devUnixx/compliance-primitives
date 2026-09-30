@@ -41,6 +41,15 @@ For details on how issues are triaged, labeled, and prioritized, see
    make lint
    ```
    Both must pass locally — the same checks run in CI on every PR.
+
+   In addition to per-PR CI, the scheduled
+   [`scheduled-workspace.yml`](./.github/workflows/scheduled-workspace.yml)
+   workflow runs `cargo check --workspace --all-targets` and
+   `cargo test --workspace` against the tip of `main` every day, independent of
+   any single PR. Two PRs can each pass CI in isolation and still fail to
+   compose once merged; this job catches that. When it goes red it opens (or
+   comments on) a tracking issue labelled `ci-main-red`, so a broken `main` is
+   not left failing silently in Actions.
 7. **If your change touches `contracts/multisig-admin` or
    `contracts/circuit-breaker`**, work through
    [`docs/admin-control-review-checklist.md`](./docs/admin-control-review-checklist.md)

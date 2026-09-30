@@ -402,24 +402,24 @@ fn test_integration_with_policy_engine() {
     // Initialize policy engine
     let engine_id = env.register(PolicyEngine, ());
     let engine = PolicyEngineClient::new(&env, &engine_id);
-    engine.initialize(&setup.issuer, &CombineOp::All);
+    engine.initialize(&setup.issuer, &CombineOp::All, &None);
 
     // Register denylist-gate and jurisdiction-flag checkkind
     engine.add_check(
         &setup.issuer,
-        &CheckKind::Denylist {
+        &CheckKind::Denylist(policy_engine::DenylistCheck {
             contract: setup.denylist_gate.address.clone(),
-        },
+        }),
     );
 
     let usa_code = String::from_slice(&env, "US");
     let permitted_codes = soroban_sdk::vec![&env, usa_code.clone()];
     engine.add_check(
         &setup.issuer,
-        &CheckKind::Jurisdiction {
+        &CheckKind::Jurisdiction(policy_engine::JurisdictionCheck {
             contract: setup.jurisdiction_flag.address.clone(),
             allowed_codes: permitted_codes,
-        },
+        }),
     );
 
     // Set jurisdictions for all

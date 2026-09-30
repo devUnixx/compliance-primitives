@@ -18,6 +18,28 @@
 //! **Composition**: this contract is meant to be called into, not deployed
 //! as a token itself. See `/examples/denylist-gate-consumer` for a worked
 //! example of a token contract wiring `check()` into its `transfer` path.
+//!
+//! # Authorization model
+//!
+//! The contract starts in single-admin mode: `admin` (set in `initialize`)
+//! authorizes every denylist mutation via `require_auth()`.
+//!
+//! `initialize_multisig` (admin-only, callable once) additionally installs an
+//! M-of-N signer set. From then on the signer set is governed as follows:
+//!
+//! - `add_signer` and `remove_signer` take the calling `caller` explicitly.
+//!   Each call runs `caller.require_auth()` and then requires `caller` to be in
+//!   the *current* signer set; any other address is rejected with
+//!   `NotAuthorized`.
+//! - A change does not take effect on a single signer's say-so. Each call
+//!   records one approval from `caller` for that exact action (add X / remove
+//!   X). Approvals are per action and de-duplicated per signer, so one signer
+//!   calling twice still counts once. The change is applied, and its pending
+//!   approvals cleared, only once `threshold` distinct current signers have
+//!   approved it.
+//! - Removals are validated before an approval is recorded: the set can never
+//!   shrink to empty, nor below the threshold (`InvalidSignerSet` /
+//!   `InvalidThreshold`).
 #![no_std]
 
 use soroban_sdk::{
@@ -45,6 +67,8 @@ enum DataKey {
     SignerSet,
     Denied(Address),
     PendingUpgrade,
+    /// Approvals collected so far for one pending signer-set change.
+    PendingSignerAction(SignerAction),
 }
 
 /// Delayed upgrade proposal state.
@@ -58,11 +82,20 @@ pub struct UpgradeState {
 /// Current on-chain schema version for this contract instance.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// The M-of-N signer set.
 #[contracttype]
 #[derive(Clone)]
 pub struct SignerSet {
     pub signers: Vec<Address>,
     pub threshold: u32,
+}
+
+/// A signer-set change that needs `threshold` distinct approvals to apply.
+#[contracttype]
+#[derive(Clone)]
+pub enum SignerAction {
+    Add(Address),
+    Remove(Address),
 }
 
 #[contractclient(name = "AuditLogClient")]
@@ -84,6 +117,30 @@ pub struct DenyAdd {
 pub struct DenyRemove {
     #[topic]
     pub address: Address,
+}
+
+#[contractevent]
+pub struct MultisigInitialized {
+    pub threshold: u32,
+    pub signer_count: u32,
+}
+
+#[contractevent]
+pub struct SignerApproved {
+    #[topic]
+    pub signer: Address,
+}
+
+#[contractevent]
+pub struct SignerAdded {
+    #[topic]
+    pub signer: Address,
+}
+
+#[contractevent]
+pub struct SignerRemoved {
+    #[topic]
+    pub signer: Address,
 }
 
 #[contractevent]
@@ -112,6 +169,8 @@ pub enum Error {
     InvalidSignerSet = 8,
     SignerNotInSet = 9,
     UpgradeNotReady = 10,
+    SignerAlreadyExists = 11,
+    MultisigNotEnabled = 12,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +418,10 @@ impl DenylistGate {
         !Self::check(env, address)
     }
 
-    /// Convert single-admin governance to an M-of-N signer set.
+    /// Install an M-of-N signer set. Admin-only; callable once.
+    ///
+    /// `signers` must be non-empty and free of duplicates, and `threshold`
+    /// must be between 1 and `signers.len()`.
     pub fn initialize_multisig(
         env: Env,
         admin: Address,
@@ -367,68 +429,152 @@ impl DenylistGate {
         threshold: u32,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+        if env.storage().instance().has(&DataKey::SignerSet) {
+            return Err(Error::AlreadyInitialized);
+        }
         if signers.is_empty() {
             return Err(Error::InvalidSignerSet);
         }
         if threshold == 0 || threshold > signers.len() {
             return Err(Error::InvalidThreshold);
         }
+        for (i, signer) in signers.iter().enumerate() {
+            for other in signers.iter().skip(i + 1) {
+                if signer == other {
+                    return Err(Error::InvalidSignerSet);
+                }
+            }
+        }
+
+        let signer_count = signers.len();
         env.storage()
             .instance()
             .set(&DataKey::SignerSet, &SignerSet { signers, threshold });
-        Ok(())
-    }
-
-    /// Add a signer in multisig mode. The caller must be an existing signer.
-    pub fn add_signer(env: Env, new_signer: Address) -> Result<(), Error> {
-        let mut signer_set: SignerSet = env
-            .storage()
-            .instance()
-            .get(&DataKey::SignerSet)
-            .ok_or(Error::NotInitialized)?;
-        Self::require_signer(&env, &signer_set)?;
-        if signer_set.signers.iter().any(|signer| signer == new_signer) {
-            return Err(Error::NotAuthorized);
+        MultisigInitialized {
+            threshold,
+            signer_count,
         }
-        signer_set.signers.push_back(new_signer);
-        env.storage().instance().set(&DataKey::SignerSet, &signer_set);
+        .publish(&env);
         Ok(())
     }
 
-    /// Remove a signer while preserving the configured threshold.
-    pub fn remove_signer(env: Env, signer: Address) -> Result<(), Error> {
-        let mut signer_set: SignerSet = env
-            .storage()
-            .instance()
-            .get(&DataKey::SignerSet)
-            .ok_or(Error::NotInitialized)?;
-        Self::require_signer(&env, &signer_set)?;
+    /// Approve adding `new_signer` to the signer set. `caller` must authorize
+    /// the call and be in the current signer set. The signer is added once
+    /// `threshold` distinct signers have approved this exact action.
+    pub fn add_signer(env: Env, caller: Address, new_signer: Address) -> Result<(), Error> {
+        let signer_set = Self::require_signer(&env, &caller)?;
+        if Self::contains(&signer_set.signers, &new_signer) {
+            return Err(Error::SignerAlreadyExists);
+        }
+        Self::approve(&env, caller, SignerAction::Add(new_signer), signer_set)
+    }
+
+    /// Approve removing `signer_to_remove` from the signer set. `caller` must
+    /// authorize the call and be in the current signer set. The signer is
+    /// removed once `threshold` distinct signers have approved this exact
+    /// action. The set may never become empty or smaller than the threshold.
+    pub fn remove_signer(
+        env: Env,
+        caller: Address,
+        signer_to_remove: Address,
+    ) -> Result<(), Error> {
+        let signer_set = Self::require_signer(&env, &caller)?;
+        if !Self::contains(&signer_set.signers, &signer_to_remove) {
+            return Err(Error::SignerNotInSet);
+        }
         if signer_set.signers.len() <= 1 {
             return Err(Error::InvalidSignerSet);
         }
-        let mut remaining = Vec::new(&env);
-        let mut found = false;
-        for current in signer_set.signers.iter() {
-            if current == signer {
-                found = true;
-            } else {
-                remaining.push_back(current);
-            }
-        }
-        if !found {
-            return Err(Error::NotAuthorized);
-        }
-        if signer_set.threshold > remaining.len() {
+        if signer_set.threshold > signer_set.signers.len() - 1 {
             return Err(Error::InvalidThreshold);
         }
-        signer_set.signers = remaining;
-        env.storage().instance().set(&DataKey::SignerSet, &signer_set);
-        Ok(())
+        Self::approve(&env, caller, SignerAction::Remove(signer_to_remove), signer_set)
+    }
+
+    /// The current signer set, or empty when multisig is not enabled.
+    pub fn signers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get::<_, SignerSet>(&DataKey::SignerSet)
+            .map(|set| set.signers)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    fn contains(signers: &Vec<Address>, address: &Address) -> bool {
+        signers.iter().any(|s| s == *address)
+    }
+
+    /// Requires `caller`'s authorization and membership in the current signer
+    /// set; returns that set.
+    fn require_signer(env: &Env, caller: &Address) -> Result<SignerSet, Error> {
+        caller.require_auth();
+        let signer_set: SignerSet = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerSet)
+            .ok_or(Error::MultisigNotEnabled)?;
+        if !Self::contains(&signer_set.signers, caller) {
+            return Err(Error::NotAuthorized);
+        }
+        Ok(signer_set)
+    }
+
+    /// Records `caller`'s approval of `action` and applies it once `threshold`
+    /// distinct signers have approved.
+    fn approve(
+        env: &Env,
+        caller: Address,
+        action: SignerAction,
+        mut signer_set: SignerSet,
+    ) -> Result<(), Error> {
+        let key = DataKey::PendingSignerAction(action.clone());
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if !Self::contains(&approvals, &caller) {
+            approvals.push_back(caller.clone());
+        }
+        SignerApproved { signer: caller }.publish(env);
+
+        // Only approvals from signers still in the set count towards the threshold.
+        let mut valid = 0u32;
+        for approver in approvals.iter() {
+            if Self::contains(&signer_set.signers, &approver) {
+                valid += 1;
+            }
+        }
+        if valid < signer_set.threshold {
+            env.storage().instance().set(&key, &approvals);
+            return Ok(());
+        }
+
+        env.storage().instance().remove(&key);
+        match action {
+            SignerAction::Add(new_signer) => {
+                signer_set.signers.push_back(new_signer.clone());
+                env.storage().instance().set(&DataKey::SignerSet, &signer_set);
+                SignerAdded { signer: new_signer }.publish(env);
+            }
+            SignerAction::Remove(removed) => {
+                let mut remaining = Vec::new(env);
+                for signer in signer_set.signers.iter() {
+                    if signer != removed {
+                        remaining.push_back(signer);
+                    }
+                }
+                signer_set.signers = remaining;
+                env.storage().instance().set(&DataKey::SignerSet, &signer_set);
+                SignerRemoved { signer: removed }.publish(env);
+            }
+        }
+        Ok(())
+    }
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
@@ -459,16 +605,6 @@ impl DenylistGate {
             return Ok(());
         }
         Err(Error::NotAuthorized)
-    }
-
-    fn require_signer(env: &Env, signer_set: &SignerSet) -> Result<(), Error> {
-        let caller = env.current_contract_address();
-        caller.require_auth();
-        if signer_set.signers.iter().any(|signer| signer == caller) {
-            Ok(())
-        } else {
-            Err(Error::SignerNotInSet)
-        }
     }
 
     fn record_audit(env: &Env, kind: Symbol, subject: &Address, detail: &str) {
