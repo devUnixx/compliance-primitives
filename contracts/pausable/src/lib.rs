@@ -11,6 +11,27 @@
 //! defined here — these are pure utility functions, not an entry-point
 //! contract.
 //!
+//! ## Pause timestamp and reason (issue #411)
+//!
+//! In addition to the simple pause flag, this crate optionally tracks **when**
+//! a pause happened (via [`env.ledger().timestamp()`]) and an optional
+//! **reason string** supplied by the caller.  Both are stored in instance
+//! storage under their own [`DataKey`] variants and are readable at any time
+//! via [`paused_since`] and [`pause_reason`].
+//!
+//! Consuming contracts that only need the basic boolean gate do not have to
+//! call the new helpers at all — [`pause`] continues to work without a reason,
+//! and the old helpers remain unchanged.  Contracts that want the richer
+//! audit trail can call [`pause_with_reason`] instead.
+//!
+//! ### Storage layout
+//!
+//! | Key             | Type         | Storage  | Lifecycle                              |
+//! |-----------------|--------------|----------|----------------------------------------|
+//! | `Paused`        | `bool`       | instance | set by [`pause`] / [`unpause`]         |
+//! | `PausedSince`   | `u64`        | instance | set by [`pause`] / cleared by [`unpause`] |
+//! | `PauseReason`   | `String`     | instance | set by [`pause_with_reason`] / cleared by [`unpause`] |
+//!
 //! ## Which contracts use this crate vs. a local pause implementation
 //!
 //! Not every contract in the workspace delegates pause state to this crate.
@@ -51,12 +72,19 @@
 //! emergency freeze (halt-all-transfers signal).
 #![no_std]
 
-use soroban_sdk::{contracttype, Env};
+use soroban_sdk::{contracttype, Env, String};
 
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Paused,
+    /// Ledger timestamp (seconds since Unix epoch) recorded when the contract
+    /// was last paused.  Absent when the contract is not paused.
+    PausedSince,
+    /// Optional human-readable reason string recorded when the contract was
+    /// last paused via [`pause_with_reason`].  Absent when no reason was
+    /// supplied or the contract is not paused.
+    PauseReason,
 }
 
 /// Returns `true` if the contract is currently paused.
@@ -70,18 +98,78 @@ pub fn is_paused(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
-/// Set the paused flag to `true`.
+/// Set the paused flag to `true` and record the current ledger timestamp.
 ///
-/// Calling this when already paused is a no-op — the flag remains set.
+/// Calling this when already paused is a no-op — the flag and timestamp remain
+/// set to their existing values.
+///
+/// To also record a reason string, call [`pause_with_reason`] instead.
 pub fn pause(env: &Env) {
-    env.storage().instance().set(&DataKey::Paused, &true);
+    if !is_paused(env) {
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::PausedSince, &env.ledger().timestamp());
+    }
+}
+
+/// Set the paused flag to `true`, record the current ledger timestamp, and
+/// store an optional `reason` string for auditability.
+///
+/// Calling this when already paused is a no-op — the existing pause state,
+/// timestamp, and reason are preserved.
+///
+/// If `reason` is `None`, any previously stored reason is left untouched (or
+/// absent).
+pub fn pause_with_reason(env: &Env, reason: Option<String>) {
+    if !is_paused(env) {
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::PausedSince, &env.ledger().timestamp());
+        if let Some(r) = reason {
+            env.storage().instance().set(&DataKey::PauseReason, &r);
+        }
+    }
 }
 
 /// Clear the paused flag, returning the contract to the active state.
 ///
+/// Also clears the stored pause timestamp and reason so they do not linger
+/// after the contract resumes.
+///
 /// Calling this when not paused is a no-op — the flag remains cleared.
 pub fn unpause(env: &Env) {
     env.storage().instance().set(&DataKey::Paused, &false);
+    env.storage().instance().remove(&DataKey::PausedSince);
+    env.storage().instance().remove(&DataKey::PauseReason);
+}
+
+/// Returns the ledger timestamp (seconds since Unix epoch) at which the
+/// contract was last paused, or `None` if the contract is not currently
+/// paused or has never been paused.
+///
+/// This value is cleared automatically when [`unpause`] is called, so it
+/// is only present while the contract is in the paused state.
+///
+/// # Example
+///
+/// ```ignore
+/// if let Some(since) = pausable::paused_since(&env) {
+///     // contract has been paused since ledger timestamp `since`
+/// }
+/// ```
+pub fn paused_since(env: &Env) -> Option<u64> {
+    env.storage().instance().get(&DataKey::PausedSince)
+}
+
+/// Returns the reason string recorded when the contract was last paused via
+/// [`pause_with_reason`], or `None` if no reason was provided or the contract
+/// is not currently paused.
+///
+/// This value is cleared automatically when [`unpause`] is called.
+pub fn pause_reason(env: &Env) -> Option<String> {
+    env.storage().instance().get(&DataKey::PauseReason)
 }
 
 /// Panic with a descriptive message if the contract is currently paused.
