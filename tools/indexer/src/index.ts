@@ -16,11 +16,20 @@
  * RPC connectivity without opening or writing to the database. Exits 0 on
  * success, 1 on any validation failure. Useful for CI pre-flight checks and
  * first-time operator setup.
+ *
+ * Optional health-check server
+ * ────────────────────────────
+ * Set HEALTH_PORT (e.g. HEALTH_PORT=8080) to start a minimal HTTP server
+ * alongside the indexer. It exposes:
+ *
+ *   GET /health  — 200 OK after the first successful poll, 503 before that
+ *   GET /status  — JSON with lastIndexedLedger and lastPollAt
  */
 
 import process from "node:process";
 import { loadConfig } from "./config.js";
 import { ComplianceDb } from "./db.js";
+import { HealthServer } from "./health.js";
 import { Indexer } from "./indexer.js";
 import { runQuery } from "./query.js";
 import { SorobanRpc } from "./rpc.js";
@@ -83,11 +92,25 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
   const db = await ComplianceDb.open(config.dbPath);
-  const indexer = new Indexer(config, db);
+
+  // Start the health/metrics HTTP server if HEALTH_PORT is configured.
+  let health: HealthServer | undefined;
+  const healthPortRaw = process.env.HEALTH_PORT?.trim();
+  if (healthPortRaw) {
+    const port = Number(healthPortRaw);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      throw new Error(`Invalid HEALTH_PORT: ${healthPortRaw} — must be a TCP port number (1–65535)`);
+    }
+    health = new HealthServer(db, { port });
+    health.start();
+  }
+
+  const indexer = new Indexer(config, db, health);
 
   function shutdown(signal: string): void {
     console.log(`\nReceived ${signal}, shutting down…`);
     indexer.stop();
+    health?.stop();
     db.close();
     process.exit(0);
   }

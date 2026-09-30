@@ -15,6 +15,7 @@
 
 import type { Config } from "./config.js";
 import type { ComplianceDb } from "./db.js";
+import type { HealthServer } from "./health.js";
 import { SorobanRpc } from "./rpc.js";
 import { decodeEvent } from "./decoder.js";
 
@@ -25,7 +26,9 @@ export class Indexer {
 
   constructor(
     private readonly config: Config,
-    private readonly db: ComplianceDb
+    private readonly db: ComplianceDb,
+    /** Optional health server; if provided, recordPoll() is called after each successful poll */
+    private readonly health?: HealthServer
   ) {
     this.rpc = new SorobanRpc(config.rpcUrl);
   }
@@ -51,6 +54,7 @@ export class Indexer {
   private async tick(): Promise<void> {
     try {
       await this.poll();
+      this.health?.recordPoll();
     } catch (err) {
       console.error("Poll error (will retry):", err);
     } finally {
