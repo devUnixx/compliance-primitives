@@ -317,6 +317,7 @@ fn test_remove_multiple_from_denylist_batch_limit_succeeds() {
         addresses.push_back(address);
     }
 
+    env.cost_estimate().budget().reset_default();
     client.remove_multiple_from_denylist(&admin, &addresses);
 
     for address in addresses.iter() {

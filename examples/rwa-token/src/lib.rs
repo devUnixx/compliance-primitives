@@ -182,9 +182,15 @@ impl RwaToken {
         }
 
         let jurisdiction = JurisdictionClient::new(&env, &jurisdiction_addr);
-        if !jurisdiction.is_permitted_jurisdiction(&from, &allowed_codes)
-            || !jurisdiction.is_permitted_jurisdiction(&to, &allowed_codes)
-        {
+        let from_permitted = matches!(
+            jurisdiction.try_is_permitted_jurisdiction(&from, &allowed_codes),
+            Ok(Ok(true))
+        );
+        let to_permitted = matches!(
+            jurisdiction.try_is_permitted_jurisdiction(&to, &allowed_codes),
+            Ok(Ok(true))
+        );
+        if !from_permitted || !to_permitted {
             return Err(Error::JurisdictionNotPermitted);
         }
 

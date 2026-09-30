@@ -26,8 +26,9 @@ use soroban_sdk::{
 };
 
 /// Batch operations are capped to reduce the chance of a single invocation
-/// exceeding Soroban instruction/resource limits.
-const MAX_BATCH_SIZE: u32 = 100;
+/// exceeding Soroban instruction/resource limits. Set to 45 to fit comfortably
+/// within Soroban's default per-invocation write-entry budget of ~50.
+const MAX_BATCH_SIZE: u32 = 45;
 
 // ---------------------------------------------------------------------------
 // Storage

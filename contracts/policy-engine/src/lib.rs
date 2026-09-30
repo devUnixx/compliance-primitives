@@ -846,7 +846,11 @@ impl PolicyEngine {
             }
             CheckKind::Jurisdiction(params) => {
                 let client = JurisdictionCheckClient::new(env, &params.contract);
-                client.is_permitted_jurisdiction(address, &params.allowed_codes)
+                // A callee error (e.g. `EmptyAllowedCodes`) fails the check.
+                matches!(
+                    client.try_is_permitted_jurisdiction(address, &params.allowed_codes),
+                    Ok(Ok(true))
+                )
             }
             CheckKind::Allowlist(params) => {
                 let client = AllowlistCheckClient::new(env, &params.contract);

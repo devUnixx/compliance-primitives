@@ -551,3 +551,33 @@ mod code_validation {
         assert_eq!(result, Err(Ok(Error::NotAuthorized)));
     }
 }
+
+#[test]
+fn test_no_expiry_never_expires() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let code = String::from_str(&env, "US");
+    client.set_jurisdiction(&issuer, &alice, &code);
+
+    env.ledger().with_mut(|li| li.sequence_number += 1_000_000);
+    assert_eq!(client.get_jurisdiction(&alice), Some(code));
+}
+
+#[test]
+fn test_jurisdiction_expires_after_valid_until() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let code = String::from_str(&env, "US");
+    let valid_until = env.ledger().sequence() + 10;
+    client.set_jurisdiction_until(&issuer, &alice, &code, &valid_until);
+
+    env.ledger().with_mut(|li| li.sequence_number = valid_until);
+    assert_eq!(client.get_jurisdiction(&alice), Some(code));
+
+    env.ledger().with_mut(|li| li.sequence_number = valid_until + 1);
+    assert_eq!(client.get_jurisdiction(&alice), None);
+    let allowed = vec![&env, String::from_str(&env, "US")];
+    assert_eq!(client.is_permitted_jurisdiction(&alice, &allowed), false);
+}

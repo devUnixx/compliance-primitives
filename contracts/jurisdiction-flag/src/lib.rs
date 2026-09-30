@@ -50,6 +50,9 @@ enum DataKey {
     ComplianceOfficer,
     Jurisdiction(Address),
     Jurisdictions(Address),
+    /// Optional expiry ledger for the address's jurisdiction codes. Absent =
+    /// never expires.
+    ValidUntil(Address),
     Paused,
 }
 
@@ -59,6 +62,13 @@ pub struct JurisdictionSet {
     #[topic]
     pub address: Address,
     pub code: String,
+}
+
+/// Emitted when a read encounters a flag whose `valid_until` has passed.
+#[contractevent]
+pub struct JurisdictionExpired {
+    #[topic]
+    pub address: Address,
 }
 
 #[contractevent]
@@ -102,6 +112,8 @@ pub enum Error {
     /// uppercase ASCII letters (ISO 3166-1 alpha-2). Also covers the empty
     /// string (#81), so there is one variant for every malformed code.
     InvalidJurisdictionCode = 6,
+    /// The `allowed_codes` list passed to `is_permitted_jurisdiction` was empty.
+    EmptyAllowedCodes = 7,
 }
 
 #[contract]
@@ -255,12 +267,42 @@ impl JurisdictionFlag {
         let mut codes = Vec::new(&env);
         codes.push_back(code.clone());
         Self::store_jurisdictions(&env, &address, &codes);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ValidUntil(address.clone()));
 
         JurisdictionSet {
             address,
             code,
         }
         .publish(&env);
+        Ok(())
+    }
+
+    /// Attach jurisdiction `code` to `address`, valid through ledger
+    /// `valid_until` (inclusive). Issuer or compliance-officer.
+    ///
+    /// Like [`set_jurisdiction`](Self::set_jurisdiction), this replaces any
+    /// existing codes. The expiry applies to every code later attached to the
+    /// address until it is cleared by `set_jurisdiction` or removal.
+    pub fn set_jurisdiction_until(
+        env: Env,
+        issuer: Address,
+        address: Address,
+        code: String,
+        valid_until: u32,
+    ) -> Result<(), Error> {
+        Self::require_compliance_authority(&env, &issuer)?;
+        Self::validate_jurisdiction_code(&code)?;
+
+        let mut codes = Vec::new(&env);
+        codes.push_back(code.clone());
+        Self::store_jurisdictions(&env, &address, &codes);
+        let until_key = DataKey::ValidUntil(address.clone());
+        env.storage().persistent().set(&until_key, &valid_until);
+        Self::extend_jurisdiction_ttl(&env, &until_key);
+
+        JurisdictionSet { address, code }.publish(&env);
         Ok(())
     }
 
@@ -306,8 +348,10 @@ impl JurisdictionFlag {
     }
 
     /// Return all jurisdiction codes attached to `address`.
+    ///
+    /// Returns an empty list once the address's `valid_until` has passed.
     pub fn list_jurisdictions(env: Env, address: Address) -> Vec<String> {
-        Self::load_jurisdictions(&env, &address)
+        Self::load_active_jurisdictions(&env, &address)
     }
 
     /// Remove stored jurisdiction codes for each address in `addresses`.
@@ -341,22 +385,30 @@ impl JurisdictionFlag {
     /// # Errors
     /// Never fails. Works even before the contract is initialized, in which
     /// case it always returns `None`.
+    ///
+    /// Returns `None` if the flag has a `valid_until` that is strictly less
+    /// than the current ledger sequence, publishing `JurisdictionExpired`.
     pub fn get_jurisdiction(env: Env, address: Address) -> Option<String> {
-        Self::load_jurisdictions(&env, &address).iter().next()
+        Self::load_active_jurisdictions(&env, &address).iter().next()
     }
 
     /// Returns `true` if `address` has a jurisdiction code that appears in
     /// `allowed_codes`. Meant to be called by other contracts enforcing a
     /// permitted-jurisdiction policy.
+    ///
+    /// Returns `Err(Error::EmptyAllowedCodes)` if the `allowed_codes` list is empty.
     pub fn is_permitted_jurisdiction(
         env: Env,
         address: Address,
         allowed_codes: Vec<String>,
-    ) -> bool {
-        let codes = Self::load_jurisdictions(&env, &address);
-        allowed_codes
+    ) -> Result<bool, Error> {
+        if allowed_codes.is_empty() {
+            return Err(Error::EmptyAllowedCodes);
+        }
+        let codes = Self::load_active_jurisdictions(&env, &address);
+        Ok(allowed_codes
             .iter()
-            .any(|allowed| codes.iter().any(|code| code == allowed))
+            .any(|allowed| codes.iter().any(|code| code == allowed)))
     }
 
     /// Unified compliance check — returns `true` if `address` has **any**
@@ -493,6 +545,27 @@ impl JurisdictionFlag {
             .extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
+    /// Like `load_jurisdictions`, but returns no codes (and publishes
+    /// `JurisdictionExpired`) once the address's `valid_until` has passed.
+    fn load_active_jurisdictions(env: &Env, address: &Address) -> Vec<String> {
+        let codes = Self::load_jurisdictions(env, address);
+        if codes.is_empty() {
+            return codes;
+        }
+        let until_key = DataKey::ValidUntil(address.clone());
+        if let Some(valid_until) = env.storage().persistent().get::<_, u32>(&until_key) {
+            if valid_until < env.ledger().sequence() {
+                JurisdictionExpired {
+                    address: address.clone(),
+                }
+                .publish(env);
+                return Vec::new(env);
+            }
+            Self::extend_jurisdiction_ttl(env, &until_key);
+        }
+        codes
+    }
+
     fn load_jurisdictions(env: &Env, address: &Address) -> Vec<String> {
         let list_key = DataKey::Jurisdictions(address.clone());
         if let Some(codes) = env.storage().persistent().get::<_, Vec<String>>(&list_key) {
@@ -521,6 +594,9 @@ impl JurisdictionFlag {
         } else {
             env.storage().persistent().remove(&list_key);
             env.storage().persistent().remove(&legacy_key);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ValidUntil(address.clone()));
         }
     }
 }

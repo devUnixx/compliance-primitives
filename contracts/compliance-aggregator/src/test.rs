@@ -834,6 +834,20 @@ fn test_circuit_breaker_freeze_short_circuits_check_address() {
     assert!(checks.is_empty());
 }
 
+#[test]
+fn test_get_config_matches_initialize() {
+    let env = Env::default();
+    let (_, gate_id, _, flag_id, _, _, client) = setup_all(&env);
+    assert_eq!(
+        client.get_config(),
+        AggregatorConfig {
+            denylist_gate: Some(gate_id),
+            jurisdiction_flag: Some(flag_id),
+            circuit_breaker: None,
+        }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Upgrade / migration path
 // ---------------------------------------------------------------------------
