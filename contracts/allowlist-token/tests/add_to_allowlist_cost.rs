@@ -60,12 +60,12 @@ fn measure_add_at_size(size: u32) -> Measurement {
     let mut budget = env.cost_estimate().budget();
     budget.reset_unlimited();
     for _ in 0..size {
-        client.add_to_allowlist(&admin, &Address::generate(&env));
+        client.add_to_allowlist(&admin, &Address::generate(&env), &None);
     }
 
     let target = Address::generate(&env);
     budget.reset_default();
-    client.add_to_allowlist(&admin, &target);
+    client.add_to_allowlist(&admin, &target, &None);
     let measurement = Measurement { size, cpu: budget.cpu_instruction_cost(), memory: budget.memory_bytes_cost() };
 
     assert!(client.is_allowed(&target));

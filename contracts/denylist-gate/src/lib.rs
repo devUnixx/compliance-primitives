@@ -21,13 +21,9 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
-    Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, Address,
+    BytesN, Env, String, Symbol, Vec,
 };
-
-/// On-chain storage schema version, returned by `schema_version`. Bump this
-/// when the storage layout changes (see STORAGE_VERSIONING.md).
-pub const SCHEMA_VERSION: u32 = 1;
 
 /// Batch operations are capped to reduce the chance of a single invocation
 /// exceeding Soroban instruction/resource limits.
@@ -43,19 +39,34 @@ enum DataKey {
     /// The admin address, set once in `initialize`. Instance storage.
     Admin,
     Paused,
+    ComplianceOfficer,
+    AuditLog,
+    SignerSet,
     Denied(Address),
-    /// A proposed, not-yet-committed upgrade. Instance storage.
     PendingUpgrade,
 }
 
-/// A pending two-step upgrade recorded by `propose_upgrade`.
+/// Delayed upgrade proposal state.
 #[contracttype]
 #[derive(Clone)]
 pub struct UpgradeState {
-    /// Hash of the already-uploaded replacement Wasm.
-    pub new_wasm_hash: BytesN<32>,
-    /// First ledger sequence at which `commit_upgrade` may install it.
-    pub activated_at: u32,
+    pub new_wasm: BytesN<32>,
+    pub activated_at: u64,
+}
+
+/// Current on-chain schema version for this contract instance.
+pub const SCHEMA_VERSION: u32 = 1;
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SignerSet {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[contractclient(name = "AuditLogClient")]
+pub trait AuditLogInterface {
+    fn record(env: Env, source: Address, kind: Symbol, subject: Address, detail: String);
 }
 
 // ---------------------------------------------------------------------------
@@ -95,8 +106,11 @@ pub enum Error {
     NotAuthorized = 3,
     ContractPaused = 4,
     BatchTooLarge = 5,
-    /// No upgrade is pending, or its delay has not yet elapsed.
-    UpgradeNotReady = 6,
+    ThresholdNotMet = 6,
+    InvalidThreshold = 7,
+    InvalidSignerSet = 8,
+    SignerNotInSet = 9,
+    UpgradeNotReady = 10,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +130,37 @@ impl DenylistGate {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    /// Assign the compliance-officer role. Admin-only.
+    pub fn set_compliance_officer(
+        env: Env,
+        admin: Address,
+        officer: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::ComplianceOfficer, &officer);
+        Ok(())
+    }
+
+    /// Revoke the compliance-officer role. Admin-only.
+    pub fn revoke_compliance_officer(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().remove(&DataKey::ComplianceOfficer);
+        Ok(())
+    }
+
+    /// Return the currently assigned compliance officer, if any.
+    pub fn get_compliance_officer(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::ComplianceOfficer)
+    }
+
+    /// Configure the optional append-only audit log. Admin-only.
+    pub fn set_audit_log(env: Env, admin: Address, audit_log: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::AuditLog, &audit_log);
         Ok(())
     }
 
@@ -156,16 +201,18 @@ impl DenylistGate {
     pub fn propose_upgrade(
         env: Env,
         admin: Address,
-        new_wasm_hash: BytesN<32>,
+        new_wasm: BytesN<32>,
         delay_ledgers: u32,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         let state = UpgradeState {
-            new_wasm_hash,
-            activated_at: env.ledger().sequence().saturating_add(delay_ledgers),
+            new_wasm,
+            activated_at: u64::from(env.ledger().sequence())
+                .saturating_add(delay_ledgers as u64),
         };
         env.storage().instance().set(&DataKey::PendingUpgrade, &state);
-        env.events().publish((soroban_sdk::symbol_short!("upg_prop"),), (admin, delay_ledgers));
+        env.events()
+            .publish((soroban_sdk::symbol_short!("upgprop"),), (admin, delay_ledgers));
         Ok(())
     }
 
@@ -180,12 +227,13 @@ impl DenylistGate {
             .instance()
             .get(&DataKey::PendingUpgrade)
             .ok_or(Error::UpgradeNotReady)?;
-        if env.ledger().sequence() < state.activated_at {
+        if u64::from(env.ledger().sequence()) < state.activated_at {
             return Err(Error::UpgradeNotReady);
         }
-        env.deployer().update_current_contract_wasm(state.new_wasm_hash);
+        env.deployer().update_current_contract_wasm(state.new_wasm);
         env.storage().instance().remove(&DataKey::PendingUpgrade);
-        env.events().publish((soroban_sdk::symbol_short!("upg_cmt"),), (admin,));
+        env.events()
+            .publish((soroban_sdk::symbol_short!("upgcommit"),), (admin,));
         Ok(())
     }
 
@@ -216,12 +264,17 @@ impl DenylistGate {
         Ok(())
     }
 
-    /// Add `address` to the denylist. Admin-only.
+    /// Add `address` to the denylist. Admin or compliance-officer.
     ///
     /// Uses persistent storage with a long TTL to avoid fail-open archival.
+    ///
+    /// Persistent denylist entries receive an explicit long TTL because their
+    /// reads can happen independently of instance-storage activity. Instance
+    /// configuration keys do not need the same treatment: Soroban bumps the
+    /// instance entry TTL when this contract is invoked.
     pub fn add_to_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
-        Self::require_admin(&env, &admin)?;
+        Self::require_compliance_authority(&env, &admin)?;
 
         const MAX_TTL: u32 = 6_311_520;
         const THRESHOLD: u32 = MAX_TTL / 2;
@@ -232,14 +285,18 @@ impl DenylistGate {
             .persistent()
             .extend_ttl(&key, THRESHOLD, MAX_TTL);
 
-        DenyAdd { address }.publish(&env);
+        DenyAdd {
+            address: address.clone(),
+        }
+        .publish(&env);
+        Self::record_audit(&env, Symbol::new(&env, "deny_add"), &address, "address added to denylist");
         Ok(())
     }
 
-    /// Remove `address` from the denylist. Admin-only.
+    /// Remove `address` from the denylist. Admin or compliance-officer.
     pub fn remove_from_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
-        Self::require_admin(&env, &admin)?;
+        Self::require_compliance_authority(&env, &admin)?;
         env.storage()
             .persistent()
             .remove(&DataKey::Denied(address.clone()));
@@ -247,6 +304,7 @@ impl DenylistGate {
             address: address.clone(),
         }
         .publish(&env);
+        Self::record_audit(&env, Symbol::new(&env, "deny_remove"), &address, "address removed from denylist");
         Ok(())
     }
 
@@ -283,6 +341,90 @@ impl DenylistGate {
             .unwrap_or(false)
     }
 
+    /// Unified compliance check — returns `true` if `address` is NOT on the
+    /// denylist, identical to calling [`check`].
+    ///
+    /// This entry point implements the shared `ComplianceCheck` interface
+    /// (`is_compliant(address) -> bool`) so external contracts can call any
+    /// of the three compliance primitives through the same pattern.
+    ///
+    /// **Not** affected by pause state — reads always succeed.
+    pub fn is_compliant(env: Env, address: Address) -> bool {
+        Self::check(env, address)
+    }
+
+    /// Return whether `address` is currently stored on the denylist.
+    pub fn is_denylisted(env: Env, address: Address) -> bool {
+        !Self::check(env, address)
+    }
+
+    /// Convert single-admin governance to an M-of-N signer set.
+    pub fn initialize_multisig(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if signers.is_empty() {
+            return Err(Error::InvalidSignerSet);
+        }
+        if threshold == 0 || threshold > signers.len() {
+            return Err(Error::InvalidThreshold);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerSet, &SignerSet { signers, threshold });
+        Ok(())
+    }
+
+    /// Add a signer in multisig mode. The caller must be an existing signer.
+    pub fn add_signer(env: Env, new_signer: Address) -> Result<(), Error> {
+        let mut signer_set: SignerSet = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerSet)
+            .ok_or(Error::NotInitialized)?;
+        Self::require_signer(&env, &signer_set)?;
+        if signer_set.signers.iter().any(|signer| signer == new_signer) {
+            return Err(Error::NotAuthorized);
+        }
+        signer_set.signers.push_back(new_signer);
+        env.storage().instance().set(&DataKey::SignerSet, &signer_set);
+        Ok(())
+    }
+
+    /// Remove a signer while preserving the configured threshold.
+    pub fn remove_signer(env: Env, signer: Address) -> Result<(), Error> {
+        let mut signer_set: SignerSet = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerSet)
+            .ok_or(Error::NotInitialized)?;
+        Self::require_signer(&env, &signer_set)?;
+        if signer_set.signers.len() <= 1 {
+            return Err(Error::InvalidSignerSet);
+        }
+        let mut remaining = Vec::new(&env);
+        let mut found = false;
+        for current in signer_set.signers.iter() {
+            if current == signer {
+                found = true;
+            } else {
+                remaining.push_back(current);
+            }
+        }
+        if !found {
+            return Err(Error::NotAuthorized);
+        }
+        if signer_set.threshold > remaining.len() {
+            return Err(Error::InvalidThreshold);
+        }
+        signer_set.signers = remaining;
+        env.storage().instance().set(&DataKey::SignerSet, &signer_set);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -298,6 +440,49 @@ impl DenylistGate {
             return Err(Error::NotAuthorized);
         }
         Ok(())
+    }
+
+    fn require_compliance_authority(env: &Env, caller: &Address) -> Result<(), Error> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if admin == *caller {
+            return Ok(());
+        }
+        if env.storage().instance().get::<DataKey, Address>(&DataKey::ComplianceOfficer)
+            == Some(caller.clone())
+        {
+            return Ok(());
+        }
+        Err(Error::NotAuthorized)
+    }
+
+    fn require_signer(env: &Env, signer_set: &SignerSet) -> Result<(), Error> {
+        let caller = env.current_contract_address();
+        caller.require_auth();
+        if signer_set.signers.iter().any(|signer| signer == caller) {
+            Ok(())
+        } else {
+            Err(Error::SignerNotInSet)
+        }
+    }
+
+    fn record_audit(env: &Env, kind: Symbol, subject: &Address, detail: &str) {
+        if let Some(audit_log) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AuditLog)
+        {
+            AuditLogClient::new(env, &audit_log).record(
+                &env.current_contract_address(),
+                &kind,
+                subject,
+                &String::from_str(env, detail),
+            );
+        }
     }
 
     fn reject_if_paused(env: &Env) -> Result<(), Error> {
