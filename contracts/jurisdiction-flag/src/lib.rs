@@ -10,16 +10,32 @@
 //! matching — it returns `true` if at least one of the address's codes
 //! appears in `allowed_codes`. An address with no codes is never permitted.
 //!
-//! **Callers**: only the configured `issuer` address may call
-//! `set_jurisdiction` / `remove_jurisdiction_multiple`. Any contract or
-//! off-chain client can read a flag via `get_jurisdiction`, and contracts
-//! enforcing a jurisdiction allowlist can call
-//! `is_permitted_jurisdiction(address, allowed_codes)` directly.
+//! **Code format**: `set_jurisdiction` only accepts ISO 3166-1 alpha-2 codes
+//! written as exactly two *uppercase* ASCII letters (`"US"`, `"GB"`, …).
+//! Anything else — empty, too short/long, lowercase (`"us"`), or containing
+//! non-letters (`"U1"`, `"U-"`) — is rejected with
+//! `Error::InvalidJurisdictionCode`. Codes are never normalized: matching in
+//! `is_permitted_jurisdiction` stays exact and case-sensitive (#54), so
+//! requiring the canonical uppercase form on write guarantees an address
+//! can't be flagged as `"us"` and then silently fail to match an
+//! `allowed_codes` entry of `"US"`.
+//!
+//! **Callers**: the configured issuer or compliance officer may call
+//! `set_jurisdiction` and `add_jurisdiction`; only the issuer may call
+//! `remove_jurisdiction`, `remove_jurisdiction_multiple`, or `upgrade`.
+//! `set_jurisdiction` / `get_jurisdiction` remain single-code conveniences.
+//! Use `add_jurisdiction`, `remove_jurisdiction`, and `list_jurisdictions`
+//! for the multi-code model. Any contract or off-chain client can read codes
+//! and call `is_permitted_jurisdiction(address, allowed_codes)` directly.
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    String, Vec,
 };
+
+/// Length in bytes of an ISO 3166-1 alpha-2 code.
+const JURISDICTION_CODE_LEN: u32 = 2;
 
 /// Extend persistent jurisdiction entries when TTL drops below this many ledgers.
 const TTL_THRESHOLD: u32 = 1_000;
@@ -33,7 +49,9 @@ enum DataKey {
     Issuer,
     ComplianceOfficer,
     Jurisdiction(Address),
-    /// Optional expiry ledger for `Jurisdiction(Address)`. Absent = never expires.
+    Jurisdictions(Address),
+    /// Optional expiry ledger for the address's jurisdiction codes. Absent =
+    /// never expires.
     ValidUntil(Address),
     Paused,
 }
@@ -59,6 +77,15 @@ pub struct JurisdictionRemoved {
     pub address: Address,
 }
 
+/// Emitted when the issuer role is reassigned via `transfer_issuer`.
+#[contractevent]
+pub struct IssuerTransferred {
+    #[topic]
+    pub old_issuer: Address,
+    #[topic]
+    pub new_issuer: Address,
+}
+
 #[contractevent]
 pub struct Paused {
     #[topic]
@@ -81,8 +108,12 @@ pub enum Error {
     /// Caller supplied an argument that is structurally invalid.
     InvalidInput = 4,
     ContractPaused = 5,
+    /// `set_jurisdiction` was given a `code` that is not exactly two
+    /// uppercase ASCII letters (ISO 3166-1 alpha-2). Also covers the empty
+    /// string (#81), so there is one variant for every malformed code.
+    InvalidJurisdictionCode = 6,
     /// The `allowed_codes` list passed to `is_permitted_jurisdiction` was empty.
-    EmptyAllowedCodes = 6,
+    EmptyAllowedCodes = 7,
 }
 
 #[contract]
@@ -90,8 +121,20 @@ pub struct JurisdictionFlag;
 
 #[contractimpl]
 impl JurisdictionFlag {
-    /// One-time setup. `issuer` is the only address allowed to set
-    /// jurisdiction codes afterward.
+    /// One-time setup that records `issuer` as the only address allowed to
+    /// set jurisdiction codes afterward.
+    ///
+    /// # Parameters
+    /// - `issuer`: the address that will be authorized to call
+    ///   [`set_jurisdiction`](Self::set_jurisdiction).
+    ///
+    /// # Auth
+    /// Requires `issuer.require_auth()`, so the issuer must sign the
+    /// initialization.
+    ///
+    /// # Errors
+    /// - [`Error::AlreadyInitialized`] if the contract has already been
+    ///   initialized. The existing issuer is left unchanged.
     pub fn initialize(env: Env, issuer: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Issuer) {
             return Err(Error::AlreadyInitialized);
@@ -102,7 +145,50 @@ impl JurisdictionFlag {
         Ok(())
     }
 
+    /// Reassign the issuer role to `new_issuer`. Requires auth from
+    /// `current_issuer`, which must be the stored issuer.
+    ///
+    /// Takes effect immediately: the old issuer loses all privileges
+    /// (including `upgrade`, `pause`, and managing the compliance officer)
+    /// as soon as this call succeeds. The compliance-officer assignment is
+    /// left untouched. Deliberately *not* blocked by `pause`, so a
+    /// compromised or rotated issuer key can always be replaced.
+    ///
+    /// Emits `IssuerTransferred { old_issuer, new_issuer }`.
+    pub fn transfer_issuer(
+        env: Env,
+        current_issuer: Address,
+        new_issuer: Address,
+    ) -> Result<(), Error> {
+        Self::require_issuer(&env, &current_issuer)?;
+        env.storage().instance().set(&DataKey::Issuer, &new_issuer);
+        IssuerTransferred {
+            old_issuer: current_issuer,
+            new_issuer,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     /// Assign the compliance-officer role. Issuer-only.
+    ///
+    /// The officer role grants access to exactly one entry point:
+    /// [`set_jurisdiction`](Self::set_jurisdiction), which is guarded by
+    /// `require_compliance_authority` (issuer *or* officer). Every other
+    /// mutating entry point is guarded by `require_issuer` and therefore
+    /// remains issuer-only, including:
+    ///
+    /// - [`remove_jurisdiction_multiple`](Self::remove_jurisdiction_multiple)
+    /// - [`pause`](Self::pause) / [`unpause`](Self::unpause)
+    /// - [`upgrade`](Self::upgrade)
+    /// - [`set_compliance_officer`](Self::set_compliance_officer) /
+    ///   [`revoke_compliance_officer`](Self::revoke_compliance_officer)
+    ///
+    /// There are no `_until` or multiple-address variants of
+    /// `set_jurisdiction`; the officer role does not extend to any other
+    /// function.
+    ///
+    /// Auth: gated by [`require_issuer`] — only the issuer may delegate this role.
     pub fn set_compliance_officer(
         env: Env,
         issuer: Address,
@@ -116,6 +202,17 @@ impl JurisdictionFlag {
     }
 
     /// Revoke the compliance-officer role. Issuer-only.
+    ///
+    /// After revocation, the officer no longer satisfies
+    /// `require_compliance_authority`, so the only entry point it previously
+    /// unlocked — [`set_jurisdiction`](Self::set_jurisdiction) — reverts to
+    /// issuer-only access. All other mutating entry points
+    /// ([`remove_jurisdiction_multiple`](Self::remove_jurisdiction_multiple),
+    /// [`pause`](Self::pause), [`unpause`](Self::unpause),
+    /// [`upgrade`](Self::upgrade)) were already issuer-only via
+    /// `require_issuer` and are unaffected.
+    ///
+    /// Auth: gated by [`require_issuer`] — only the issuer may revoke the delegated role.
     pub fn revoke_compliance_officer(env: Env, issuer: Address) -> Result<(), Error> {
         Self::require_issuer(&env, &issuer)?;
         env.storage()
@@ -125,6 +222,8 @@ impl JurisdictionFlag {
     }
 
     /// Pause all mutating operations. Issuer-only.
+    ///
+    /// Auth: gated by [`require_issuer`] — pause/unpause is a lifecycle operation reserved for the issuer.
     pub fn pause(env: Env, issuer: Address) -> Result<(), Error> {
         Self::require_issuer(&env, &issuer)?;
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -136,6 +235,8 @@ impl JurisdictionFlag {
     }
 
     /// Resume all mutating operations. Issuer-only.
+    ///
+    /// Auth: gated by [`require_issuer`] — pause/unpause is a lifecycle operation reserved for the issuer.
     pub fn unpause(env: Env, issuer: Address) -> Result<(), Error> {
         Self::require_issuer(&env, &issuer)?;
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -147,6 +248,13 @@ impl JurisdictionFlag {
     }
 
     /// Attach jurisdiction `code` to `address`. Issuer or compliance-officer.
+    ///
+    /// `code` must be an ISO 3166-1 alpha-2 code in canonical uppercase form
+    /// (see the module docs); otherwise returns
+    /// `Error::InvalidJurisdictionCode` and nothing is stored.
+    ///
+    /// Auth: gated by [`require_compliance_authority`] — allows either the issuer or a
+    /// delegated compliance officer, so routine flag management does not require the issuer key.
     pub fn set_jurisdiction(
         env: Env,
         issuer: Address,
@@ -154,10 +262,11 @@ impl JurisdictionFlag {
         code: String,
     ) -> Result<(), Error> {
         Self::require_compliance_authority(&env, &issuer)?;
+        Self::validate_jurisdiction_code(&code)?;
 
-        let key = DataKey::Jurisdiction(address.clone());
-        env.storage().persistent().set(&key, &code);
-        Self::extend_jurisdiction_ttl(&env, &key);
+        let mut codes = Vec::new(&env);
+        codes.push_back(code.clone());
+        Self::store_jurisdictions(&env, &address, &codes);
         env.storage()
             .persistent()
             .remove(&DataKey::ValidUntil(address.clone()));
@@ -172,6 +281,10 @@ impl JurisdictionFlag {
 
     /// Attach jurisdiction `code` to `address`, valid through ledger
     /// `valid_until` (inclusive). Issuer or compliance-officer.
+    ///
+    /// Like [`set_jurisdiction`](Self::set_jurisdiction), this replaces any
+    /// existing codes. The expiry applies to every code later attached to the
+    /// address until it is cleared by `set_jurisdiction` or removal.
     pub fn set_jurisdiction_until(
         env: Env,
         issuer: Address,
@@ -180,10 +293,11 @@ impl JurisdictionFlag {
         valid_until: u32,
     ) -> Result<(), Error> {
         Self::require_compliance_authority(&env, &issuer)?;
+        Self::validate_jurisdiction_code(&code)?;
 
-        let key = DataKey::Jurisdiction(address.clone());
-        env.storage().persistent().set(&key, &code);
-        Self::extend_jurisdiction_ttl(&env, &key);
+        let mut codes = Vec::new(&env);
+        codes.push_back(code.clone());
+        Self::store_jurisdictions(&env, &address, &codes);
         let until_key = DataKey::ValidUntil(address.clone());
         env.storage().persistent().set(&until_key, &valid_until);
         Self::extend_jurisdiction_ttl(&env, &until_key);
@@ -192,7 +306,57 @@ impl JurisdictionFlag {
         Ok(())
     }
 
+    /// Add `code` to `address`'s jurisdiction codes if it is not already present.
+    /// Issuer or compliance-officer only.
+    pub fn add_jurisdiction(
+        env: Env,
+        issuer: Address,
+        address: Address,
+        code: String,
+    ) -> Result<(), Error> {
+        Self::require_compliance_authority(&env, &issuer)?;
+        Self::validate_jurisdiction_code(&code)?;
+
+        let mut codes = Self::load_jurisdictions(&env, &address);
+        if !codes.iter().any(|existing| existing == code) {
+            codes.push_back(code.clone());
+            Self::store_jurisdictions(&env, &address, &codes);
+        }
+
+        JurisdictionSet { address, code }.publish(&env);
+        Ok(())
+    }
+
+    /// Remove `code` from `address`'s jurisdiction codes. Issuer-only.
+    pub fn remove_jurisdiction(
+        env: Env,
+        issuer: Address,
+        address: Address,
+        code: String,
+    ) -> Result<(), Error> {
+        Self::require_issuer(&env, &issuer)?;
+
+        let mut remaining = Vec::new(&env);
+        for existing in Self::load_jurisdictions(&env, &address).iter() {
+            if existing != code {
+                remaining.push_back(existing);
+            }
+        }
+        Self::store_jurisdictions(&env, &address, &remaining);
+        JurisdictionRemoved { address }.publish(&env);
+        Ok(())
+    }
+
+    /// Return all jurisdiction codes attached to `address`.
+    ///
+    /// Returns an empty list once the address's `valid_until` has passed.
+    pub fn list_jurisdictions(env: Env, address: Address) -> Vec<String> {
+        Self::load_active_jurisdictions(&env, &address)
+    }
+
     /// Remove stored jurisdiction codes for each address in `addresses`.
+    ///
+    /// Auth: gated by [`require_issuer`] — bulk removal is a privileged operation reserved for the issuer.
     pub fn remove_jurisdiction_multiple(
         env: Env,
         issuer: Address,
@@ -200,12 +364,7 @@ impl JurisdictionFlag {
     ) -> Result<(), Error> {
         Self::require_issuer(&env, &issuer)?;
         for address in addresses.iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Jurisdiction(address.clone()));
-            env.storage()
-                .persistent()
-                .remove(&DataKey::ValidUntil(address.clone()));
+            Self::store_jurisdictions(&env, &address, &Vec::new(&env));
             JurisdictionRemoved { address }.publish(&env);
         }
         Ok(())
@@ -213,24 +372,24 @@ impl JurisdictionFlag {
 
     /// Returns the jurisdiction code attached to `address`, if any.
     ///
+    /// # Parameters
+    /// - `address`: the address to look up.
+    ///
+    /// # Returns
+    /// `Some(code)` if a code has been set via
+    /// [`set_jurisdiction`](Self::set_jurisdiction), otherwise `None`.
+    ///
+    /// # Auth
+    /// None. This is a read-only call anyone may make.
+    ///
+    /// # Errors
+    /// Never fails. Works even before the contract is initialized, in which
+    /// case it always returns `None`.
+    ///
     /// Returns `None` if the flag has a `valid_until` that is strictly less
     /// than the current ledger sequence, publishing `JurisdictionExpired`.
     pub fn get_jurisdiction(env: Env, address: Address) -> Option<String> {
-        let key = DataKey::Jurisdiction(address.clone());
-        let code: Option<String> = env.storage().persistent().get(&key);
-        if code.is_some() {
-            let until_key = DataKey::ValidUntil(address.clone());
-            let valid_until: Option<u32> = env.storage().persistent().get(&until_key);
-            if let Some(valid_until) = valid_until {
-                if valid_until < env.ledger().sequence() {
-                    JurisdictionExpired { address }.publish(&env);
-                    return None;
-                }
-                Self::extend_jurisdiction_ttl(&env, &until_key);
-            }
-            Self::extend_jurisdiction_ttl(&env, &key);
-        }
-        code
+        Self::load_active_jurisdictions(&env, &address).iter().next()
     }
 
     /// Returns `true` if `address` has a jurisdiction code that appears in
@@ -246,10 +405,28 @@ impl JurisdictionFlag {
         if allowed_codes.is_empty() {
             return Err(Error::EmptyAllowedCodes);
         }
-        match Self::get_jurisdiction(env, address) {
-            Some(code) => Ok(allowed_codes.iter().any(|c| c == code)),
-            None => Ok(false),
-        }
+        let codes = Self::load_active_jurisdictions(&env, &address);
+        Ok(allowed_codes
+            .iter()
+            .any(|allowed| codes.iter().any(|code| code == allowed)))
+    }
+
+    /// Unified compliance check — returns `true` if `address` has **any**
+    /// jurisdiction code set, i.e. it has been through an onboarding/KYC
+    /// process that assigned it a jurisdiction.
+    ///
+    /// This entry point implements the shared `ComplianceCheck` interface
+    /// (`is_compliant(address) -> bool`).  Unlike [`is_permitted_jurisdiction`],
+    /// it does not validate the code against a permitted-jurisdictions list
+    /// because the `ComplianceCheck` interface carries only `address`.
+    ///
+    /// Use [`is_permitted_jurisdiction`] when you need to enforce a specific
+    /// set of allowed codes.  Use `is_compliant` for the lighter check of
+    /// "has this address been assigned a jurisdiction at all".
+    ///
+    /// Not affected by pause state — reads always succeed.
+    pub fn is_compliant(env: Env, address: Address) -> bool {
+        Self::get_jurisdiction(env, address).is_some()
     }
 
     // -----------------------------------------------------------------------
@@ -268,6 +445,27 @@ impl JurisdictionFlag {
         Ok(())
     }
 
+    /// Strict single-address auth gate — only the address stored as `issuer`
+    /// at [`initialize`] time may pass.
+    ///
+    /// ## Authorization split
+    ///
+    /// This helper enforces the *tightest* authorization level in the contract.
+    /// It is used by every entry point that changes the contract's own
+    /// configuration or lifecycle (pause/unpause, compliance-officer
+    /// assignment, bulk jurisdiction removal, WASM upgrade). The reasoning is
+    /// that these operations affect the contract's trust model itself, so they
+    /// must be gated on the one address the deployer designated at setup —
+    /// the issuer — and no delegation is permitted.
+    ///
+    /// Contrast with [`require_compliance_authority`], which additionally
+    /// allows a delegated compliance officer for day-to-day data operations.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`Error::NotInitialized`] if `initialize` has not been called
+    /// yet, or [`Error::NotAuthorized`] if `issuer` does not match the stored
+    /// issuer address.
     fn require_issuer(env: &Env, issuer: &Address) -> Result<(), Error> {
         issuer.require_auth();
         let stored_issuer: Address = env
@@ -281,7 +479,31 @@ impl JurisdictionFlag {
         Ok(())
     }
 
-    /// Checks that `caller` is either the issuer or the compliance officer.
+    /// Looser auth gate — passes if `caller` is the issuer **or** the
+    /// currently assigned compliance officer.
+    ///
+    /// ## Authorization split
+    ///
+    /// This helper enforces a *delegated* authorization level intended for
+    /// routine compliance data operations (currently: [`set_jurisdiction`]).
+    /// The issuer can optionally appoint a compliance officer via
+    /// [`set_compliance_officer`]; once appointed, that officer may call any
+    /// entry point gated by this helper without requiring the issuer key for
+    /// every individual flag operation.
+    ///
+    /// Entry points that mutate the contract's *configuration* (who the
+    /// compliance officer is, whether the contract is paused, etc.) use the
+    /// stricter [`require_issuer`] instead, so a compromised compliance-officer
+    /// key cannot escalate its own privileges.
+    ///
+    /// If no compliance officer has been set, this helper behaves identically
+    /// to [`require_issuer`].
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`Error::NotInitialized`] if `initialize` has not been called,
+    /// or [`Error::NotAuthorized`] if `caller` is neither the issuer nor the
+    /// compliance officer.
     fn require_compliance_authority(env: &Env, caller: &Address) -> Result<(), Error> {
         caller.require_auth();
         let stored_issuer: Address = env
@@ -304,10 +526,78 @@ impl JurisdictionFlag {
         Err(Error::NotAuthorized)
     }
 
+    /// Accepts only exactly two uppercase ASCII letters (`A`–`Z`).
+    fn validate_jurisdiction_code(code: &String) -> Result<(), Error> {
+        if code.len() != JURISDICTION_CODE_LEN {
+            return Err(Error::InvalidJurisdictionCode);
+        }
+        let mut buf = [0u8; JURISDICTION_CODE_LEN as usize];
+        code.copy_into_slice(&mut buf);
+        if !buf.iter().all(u8::is_ascii_uppercase) {
+            return Err(Error::InvalidJurisdictionCode);
+        }
+        Ok(())
+    }
+
     fn extend_jurisdiction_ttl(env: &Env, key: &DataKey) {
         env.storage()
             .persistent()
             .extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Like `load_jurisdictions`, but returns no codes (and publishes
+    /// `JurisdictionExpired`) once the address's `valid_until` has passed.
+    fn load_active_jurisdictions(env: &Env, address: &Address) -> Vec<String> {
+        let codes = Self::load_jurisdictions(env, address);
+        if codes.is_empty() {
+            return codes;
+        }
+        let until_key = DataKey::ValidUntil(address.clone());
+        if let Some(valid_until) = env.storage().persistent().get::<_, u32>(&until_key) {
+            if valid_until < env.ledger().sequence() {
+                JurisdictionExpired {
+                    address: address.clone(),
+                }
+                .publish(env);
+                return Vec::new(env);
+            }
+            Self::extend_jurisdiction_ttl(env, &until_key);
+        }
+        codes
+    }
+
+    fn load_jurisdictions(env: &Env, address: &Address) -> Vec<String> {
+        let list_key = DataKey::Jurisdictions(address.clone());
+        if let Some(codes) = env.storage().persistent().get::<_, Vec<String>>(&list_key) {
+            Self::extend_jurisdiction_ttl(env, &list_key);
+            return codes;
+        }
+
+        let legacy_key = DataKey::Jurisdiction(address.clone());
+        match env.storage().persistent().get::<_, String>(&legacy_key) {
+            Some(code) => {
+                Self::extend_jurisdiction_ttl(env, &legacy_key);
+                Vec::from_array(env, [code])
+            }
+            None => Vec::new(env),
+        }
+    }
+
+    fn store_jurisdictions(env: &Env, address: &Address, codes: &Vec<String>) {
+        let list_key = DataKey::Jurisdictions(address.clone());
+        let legacy_key = DataKey::Jurisdiction(address.clone());
+        if let Some(first_code) = codes.iter().next() {
+            env.storage().persistent().set(&list_key, codes);
+            Self::extend_jurisdiction_ttl(env, &list_key);
+            env.storage().persistent().set(&legacy_key, &first_code);
+            Self::extend_jurisdiction_ttl(env, &legacy_key);
+        } else {
+            env.storage().persistent().remove(&list_key);
+            env.storage().persistent().remove(&legacy_key);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ValidUntil(address.clone()));
+        }
     }
 }
 

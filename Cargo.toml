@@ -4,6 +4,7 @@ members = [
     "contracts/allowlist-token",
     "contracts/audit-log",
     "contracts/compliance-aggregator",
+    "contracts/compliance-check",
     "contracts/denylist-gate",
     "contracts/jurisdiction-flag",
     "contracts/circuit-breaker",
@@ -14,6 +15,8 @@ members = [
     "examples/denylist-gate-sep41",
     "examples/jurisdiction-denylist-consumer",
     "examples/compliance-integration-flow",
+    "examples/multisig-governed-allowlist",
+    "crates/test-trace",
 ]
 
 [workspace.package]

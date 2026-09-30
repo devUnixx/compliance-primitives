@@ -28,7 +28,7 @@ pub trait DenylistGateInterface {
 
 #[contractclient(name = "JurisdictionFlagClient")]
 pub trait JurisdictionFlagInterface {
-    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> Result<bool, u32>;
+    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> bool;
 }
 
 #[contracttype]
@@ -119,8 +119,10 @@ impl JurisdictionDenylistConsumer {
         }
 
         let jurisdiction = JurisdictionFlagClient::new(&env, &jurisdiction_address);
-        let permitted = jurisdiction.is_permitted_jurisdiction(&from, &allowed_jurisdictions)
-            .map_err(|_| Error::DeniedByJurisdiction)?;
+        let permitted = matches!(
+            jurisdiction.try_is_permitted_jurisdiction(&from, &allowed_jurisdictions),
+            Ok(Ok(true))
+        );
         if !permitted {
             return Err(Error::DeniedByJurisdiction);
         }

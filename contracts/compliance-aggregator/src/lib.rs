@@ -50,10 +50,40 @@
 //! Both checks are optional; if a check type's contract address has not been
 //! registered the check is skipped (treated as passing). Registering at least
 //! one check is enforced at call time.
+//!
+//! ## Upgradeability
+//!
+//! `upgrade(admin, new_wasm_hash)` lets the configured admin move the
+//! contract's code to a new WASM hash via
+//! `env.deployer().update_current_contract_wasm`, following the same
+//! admin-gated pattern used by `jurisdiction-flag` and `policy-engine`.
+//! Only the stored admin may call it; any other caller is rejected with
+//! `Error::NotAuthorized`, and calling it before `initialize` returns
+//! `Error::NotInitialized`. An `UpgradePerformed` event is emitted so the
+//! upgrade is visible to indexers.
+//!
+//! The WASM swap does not touch storage: the admin, the registered
+//! `denylist-gate` / `jurisdiction-flag` / `circuit-breaker` addresses, and
+//! the pause flag all live in instance storage under the same `DataKey`
+//! variants and are read unchanged by the new code, so the contract is
+//! callable immediately after the upgrade. Upgrade procedure:
+//!
+//! 1. Build the new release WASM
+//!    (`stellar contract build` / `make build`).
+//! 2. Upload it: `stellar contract upload --wasm compliance_aggregator.wasm`
+//!    — this prints the new WASM hash.
+//! 3. Invoke `upgrade --admin <ADMIN> --new_wasm_hash <HASH>` on the
+//!    deployed aggregator, signed by the admin (or the `multisig-admin`
+//!    quorum if the admin is a multisig).
+//!
+//! A new version **must not** reorder or remove existing `DataKey` variants
+//! or change the types stored under them; add new variants instead. See
+//! `STORAGE_VERSIONING.md` for the repo-wide rules.
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    String, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -71,7 +101,7 @@ pub trait DenylistGateInterface {
 /// Must match the actual contract's exported function signature exactly.
 #[soroban_sdk::contractclient(name = "JurisdictionFlagClient")]
 pub trait JurisdictionFlagInterface {
-    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> Result<bool, jurisdiction_flag::Error>;
+    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> bool;
 }
 
 /// Subset of the `circuit-breaker` interface that this aggregator uses.
@@ -79,6 +109,48 @@ pub trait JurisdictionFlagInterface {
 #[soroban_sdk::contractclient(name = "CircuitBreakerClient")]
 pub trait CircuitBreakerInterface {
     fn is_frozen(env: Env) -> bool;
+}
+
+// ---------------------------------------------------------------------------
+// TTL policy
+// ---------------------------------------------------------------------------
+
+/// TTL policy for this contract's stored state.
+///
+/// Every piece of configuration the aggregator keeps (`Admin`,
+/// `DenylistGate`, `JurisdictionFlag`, `CircuitBreaker`, and the pause flag)
+/// lives in **instance** storage, which shares a single TTL with the contract
+/// instance itself. If that TTL lapses the whole contract is archived and
+/// every call fails until someone submits a manual restore.
+///
+/// To prevent that, every write path calls [`extend_instance_ttl`], which
+/// bumps the instance TTL back up to [`INSTANCE_TTL_EXTEND_TO`] whenever the
+/// remaining TTL has fallen below [`INSTANCE_TTL_THRESHOLD`]. The values
+/// mirror `allowlist-token`'s persistent-entry policy:
+///
+/// | Constant                  | Ledgers     | ~Wall-clock (5s/ledger) |
+/// |---------------------------|-------------|-------------------------|
+/// | `INSTANCE_TTL_THRESHOLD`  | `120_960`   | ~7 days                 |
+/// | `INSTANCE_TTL_EXTEND_TO`  | `1_555_200` | ~90 days                |
+///
+/// So as long as the contract is written to at least once every ~83 days
+/// (90 − 7), its state never becomes archived. Extending only below the
+/// threshold keeps the per-write rent cost to at most one bump per ~83 days.
+///
+/// Extend the instance TTL when its remaining TTL drops below this many
+/// ledgers (~7 days at ~5s/ledger on mainnet).
+pub(crate) const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+
+/// Target remaining instance TTL after extension (~90 days at ~5s/ledger).
+pub(crate) const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+
+/// Bump the contract instance TTL (and therefore every instance-storage
+/// entry) according to the policy documented above. Called from every
+/// storage write path.
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +244,15 @@ pub struct CircuitBreakerSet {
     pub breaker: Address,
 }
 
+/// Emitted whenever the contract is upgraded to a new WASM implementation,
+/// for on-chain auditability of the upgrade path.
+#[contractevent]
+pub struct UpgradePerformed {
+    #[topic]
+    pub admin: Address,
+    pub new_wasm_hash: BytesN<32>,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -186,6 +267,7 @@ pub enum Error {
     NoChecksRegistered = 4,
     EmptyAddressList = 5,
     BatchTooLarge = 6,
+    ContractPaused = 7,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +328,7 @@ impl ComplianceAggregator {
                 .set(&DataKey::CircuitBreaker, &breaker);
             CircuitBreakerSet { breaker }.publish(&env);
         }
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -253,6 +336,7 @@ impl ComplianceAggregator {
     pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         compliance_pausable::pause(&env);
+        extend_instance_ttl(&env);
         env.events().publish((), soroban_sdk::symbol_short!("Paused"));
         Ok(())
     }
@@ -261,6 +345,7 @@ impl ComplianceAggregator {
     pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         compliance_pausable::unpause(&env);
+        extend_instance_ttl(&env);
         env.events().publish((), soroban_sdk::symbol_short!("Unpaused"));
         Ok(())
     }
@@ -279,6 +364,7 @@ impl ComplianceAggregator {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        extend_instance_ttl(&env);
         AdminSet { admin: new_admin }.publish(&env);
         Ok(())
     }
@@ -288,6 +374,7 @@ impl ComplianceAggregator {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::DenylistGate, &gate);
+        extend_instance_ttl(&env);
         DenylistGateSet { gate }.publish(&env);
         Ok(())
     }
@@ -299,6 +386,7 @@ impl ComplianceAggregator {
         env.storage()
             .instance()
             .set(&DataKey::JurisdictionFlag, &flag);
+        extend_instance_ttl(&env);
         JurisdictionFlagSet { flag }.publish(&env);
         Ok(())
     }
@@ -310,7 +398,26 @@ impl ComplianceAggregator {
         env.storage()
             .instance()
             .set(&DataKey::CircuitBreaker, &breaker);
+        extend_instance_ttl(&env);
         CircuitBreakerSet { breaker }.publish(&env);
+        Ok(())
+    }
+
+    /// Upgrade the contract WASM. Admin-only.
+    ///
+    /// Swaps the code behind this contract ID to `new_wasm_hash` (which must
+    /// already be uploaded to the network). All instance storage — admin,
+    /// registered check addresses, circuit-breaker, pause flag — is
+    /// preserved across the upgrade. See the module-level "Upgradeability"
+    /// section for the full procedure.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        UpgradePerformed {
+            admin,
+            new_wasm_hash: new_wasm_hash.clone(),
+        }
+        .publish(&env);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
 
@@ -326,6 +433,20 @@ impl ComplianceAggregator {
     /// Returns the currently registered `jurisdiction-flag` address, if any.
     pub fn jurisdiction_flag(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::JurisdictionFlag)
+    }
+
+    /// Returns whether a denylist-gate check and/or a jurisdiction-flag check
+    /// are configured without requiring two separate view calls.
+    pub fn get_checks_summary(env: Env) -> (bool, bool) {
+        let denylist_gate: Option<Address> = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::DenylistGate);
+        let jurisdiction_flag: Option<Address> = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::JurisdictionFlag);
+        (denylist_gate.is_some(), jurisdiction_flag.is_some())
     }
 
     /// Returns the currently registered `circuit-breaker` address, if any.
@@ -412,7 +533,10 @@ impl ComplianceAggregator {
             .get::<DataKey, Address>(&DataKey::JurisdictionFlag)
         {
             let client = JurisdictionFlagClient::new(&env, &flag_addr);
-            let passed = client.is_permitted_jurisdiction(&address, &allowed_jurisdictions)?;
+            let passed = matches!(
+                    client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions),
+                    Ok(Ok(true))
+                );
             all_passed = all_passed && passed;
             results.push_back(CheckResult {
                 check: CheckKind::Jurisdiction,
@@ -498,7 +622,10 @@ impl ComplianceAggregator {
             if let Some(ref fa) = flag_addr {
                 let client = JurisdictionFlagClient::new(&env, fa);
                 let passed =
-                    client.is_permitted_jurisdiction(&address, &allowed_jurisdictions)?;
+                    matches!(
+                    client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions),
+                    Ok(Ok(true))
+                );
                 all_passed = all_passed && passed;
                 results.push_back(CheckResult {
                     check: CheckKind::Jurisdiction,
@@ -567,7 +694,10 @@ impl ComplianceAggregator {
             if let Some(ref fa) = flag_addr {
                 let client = JurisdictionFlagClient::new(&env, fa);
                 all_passed =
-                    all_passed && client.is_permitted_jurisdiction(&address, &allowed_jurisdictions)?;
+                    all_passed && matches!(
+                    client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions),
+                    Ok(Ok(true))
+                );
             }
 
             results.push_back(all_passed);
