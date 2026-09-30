@@ -350,6 +350,72 @@ export class ComplianceDb {
     this.flush();
   }
 
+  /**
+   * Query indexed compliance events that reference a given address (as
+   * primary subject or secondary address in Blocked events).
+   *
+   * @param address   Stellar/Soroban address to filter by (G… or C…).
+   * @param options   Optional filters:
+   *   - contractId   Restrict to a specific contract.
+   *   - eventType    Restrict to a specific event type (e.g. "DenyAdd").
+   *   - limit        Maximum number of rows to return (default 100).
+   *   - offset       Row offset for pagination (default 0).
+   */
+  queryEventsByAddress(
+    address: string,
+    options: {
+      contractId?: string;
+      eventType?: string;
+      limit?: number;
+      offset?: number;
+    } = {}
+  ): RawEvent[] {
+    const { contractId, eventType, limit = 100, offset = 0 } = options;
+    const conditions: string[] = ["(address = ? OR address_to = ?)"];
+    const params: (string | number)[] = [address, address];
+
+    if (contractId) {
+      conditions.push("contract_id = ?");
+      params.push(contractId);
+    }
+    if (eventType) {
+      conditions.push("event_type = ?");
+      params.push(eventType);
+    }
+
+    params.push(limit, offset);
+    const sql = `
+      SELECT
+        id, ledger_sequence, timestamp, contract_id, event_type,
+        address, address_to, amount, jurisdiction,
+        kind, source, detail,
+        raw_topics, raw_data
+      FROM events
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY ledger_sequence DESC, id DESC
+      LIMIT ? OFFSET ?
+    `;
+
+    const result = this.db.exec(sql, params);
+    if (!result.length || !result[0].values.length) return [];
+
+    return result[0].values.map((row): RawEvent => ({
+      ledgerSequence: Number(row[1]),
+      timestamp:      row[2] != null ? Number(row[2]) : null,
+      contractId:     String(row[3]),
+      eventType:      String(row[4]),
+      address:        row[5] != null ? String(row[5]) : null,
+      addressTo:      row[6] != null ? String(row[6]) : null,
+      amount:         row[7] != null ? String(row[7]) : null,
+      jurisdiction:   row[8] != null ? String(row[8]) : null,
+      kind:           row[9] != null ? String(row[9]) : null,
+      source:         row[10] != null ? String(row[10]) : null,
+      detail:         row[11] != null ? String(row[11]) : null,
+      rawTopics:      String(row[12]),
+      rawData:        String(row[13]),
+    }));
+  }
+
   getEventCount(contractId?: string): number {
     const result = contractId
       ? this.db.exec("SELECT COUNT(*) AS count FROM events WHERE contract_id = ?", [contractId])

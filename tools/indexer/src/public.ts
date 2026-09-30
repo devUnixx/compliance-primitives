@@ -11,6 +11,8 @@ export type { HealthServerOptions, StatusPayload } from "./health.js";
 
 export { Indexer } from "./indexer.js";
 
+export { runQuery } from "./query.js";
+
 export { SorobanRpc } from "./rpc.js";
 export type {
   GetEventsParams,

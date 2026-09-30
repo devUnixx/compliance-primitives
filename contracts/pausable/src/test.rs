@@ -1,4 +1,4 @@
-use crate::{is_paused, pause, require_not_paused, unpause};
+use crate::{is_paused, pause, require_not_paused, require_paused, unpause};
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{contract, contractimpl, Address, Env};
 
@@ -27,6 +27,13 @@ impl Harness {
     /// without a separate entry point.
     pub fn check_not_paused(env: Env) -> bool {
         crate::require_not_paused(&env);
+        true
+    }
+
+    /// Calls `require_paused` and returns `true` if the call succeeds
+    /// (i.e. the contract is currently paused).
+    pub fn check_paused(env: Env) -> bool {
+        crate::require_paused(&env);
         true
     }
 }
@@ -127,4 +134,49 @@ fn test_require_not_paused_panics_when_paused() {
     client.pause();
     // This call must panic because the contract is paused
     client.check_not_paused();
+}
+
+// ─── require_paused ─────────────────────────────────────────────────────────
+
+/// `require_paused` should succeed (not panic) when the contract IS paused.
+#[test]
+fn test_require_paused_succeeds_when_paused() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    client.pause();
+    // check_paused calls require_paused — must not panic
+    assert!(client.check_paused());
+}
+
+/// `require_paused` must panic when the contract is NOT paused.
+#[test]
+#[should_panic]
+fn test_require_paused_panics_when_not_paused() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    // Not paused — require_paused must panic
+    client.check_paused();
+}
+
+/// Verify symmetry: require_not_paused and require_paused are strict inverses.
+#[test]
+fn test_require_paused_and_require_not_paused_are_symmetric() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    // Initially not paused — only check_not_paused must succeed.
+    assert!(client.check_not_paused());
+
+    // After pause — only check_paused must succeed.
+    client.pause();
+    assert!(client.check_paused());
+
+    // After unpause — only check_not_paused must succeed again.
+    client.unpause();
+    assert!(client.check_not_paused());
 }
