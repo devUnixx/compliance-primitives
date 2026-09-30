@@ -8,7 +8,7 @@
  *   topic[1+] = the fields annotated #[topic] in declaration order
  *   data      = ScVal — struct-value encoding of any non-topic fields
  *
- * For the five event types from allowlist/denylist/jurisdiction contracts:
+ * For primitive and circuit-breaker events:
  *
  *   AllowAdd        topics: [Symbol("AllowAdd"), Address]          data: Void
  *   AllowRemove     topics: [Symbol("AllowRemove"), Address]        data: Void
@@ -18,6 +18,17 @@
  *   JurisdictionSet topics: [Symbol("JurisdictionSet"), Address]    data: String(code)
  *   Frozen          topics: [Symbol("Frozen"), Address(admin)]       data: Void
  *   Unfrozen        topics: [Symbol("Unfrozen"), Address(admin)]     data: Void
+ *
+ * For policy-engine:
+ *
+ *   PolicyResult topics: [Symbol("PolicyResult"), Bool(passed)]
+ *               data:   Vec[Address(from), Address(to)]
+ *
+ * For multisig-admin:
+ *
+ *   SignerAdd / SignerRm topics: [Symbol(name), Address(signer)] data: Void
+ *   ThreshSet            topics: [Symbol("ThreshSet")]          data: U32(threshold)
+ *   AuthOk               topics: [Symbol("AuthOk")]             data: Vec[U32(valid_count), U32(threshold)]
  *
  * For the audit-log contract's ComplianceEvent:
  *
@@ -303,6 +314,14 @@ const KNOWN_EVENTS = new Set([
   "DenyAdd",
   "DenyRemove",
   "JurisdictionSet",
+  "SignerAdd",
+  "SignerRm",
+  "ThreshSet",
+  "AuthOk",
+  "PolicyResult",
+  "AdminSet",
+  "DenylistGateSet",
+  "JurisdictionFlagSet",
   // Note: Frozen/Unfrozen are circuit-breaker events handled separately below
   // because their topic[1] carries the admin address but the stored event
   // intentionally leaves `address` null — the contract_id column identifies
@@ -327,6 +346,28 @@ export function decodeEvent(
     const timestamp = raw.ledgerClosedAt
       ? Math.floor(new Date(raw.ledgerClosedAt).getTime() / 1000)
       : null;
+
+    const base: RawEvent = {
+      ledgerSequence: raw.ledger,
+      timestamp,
+      contractId: raw.contractId,
+      eventType: "",
+      address: null,
+      addressTo: null,
+      amount: null,
+      jurisdiction: null,
+      kind: null,
+      source: null,
+      detail: null,
+      signerAddress: null,
+      newThreshold: null,
+      validCount: null,
+      policyFrom: null,
+      policyTo: null,
+      policyPassed: null,
+      rawTopics: JSON.stringify(raw.topic),
+      rawData: raw.value ?? "",
+    };
 
     // ── audit-log ComplianceEvent detection ──────────────────────────────────
     //
@@ -363,6 +404,12 @@ export function decodeEvent(
           detail: detailVal?.type === "String" || detailVal?.type === "Symbol"
             ? detailVal.value
             : null,
+          signerAddress: null,
+          newThreshold: null,
+          validCount: null,
+          policyFrom: null,
+          policyTo: null,
+          policyPassed: null,
           rawTopics: JSON.stringify(raw.topic),
           rawData: raw.value ?? "",
         };
@@ -386,24 +433,55 @@ export function decodeEvent(
     // intentionally store address as null — the contract_id column identifies
     // which breaker instance changed state, which is the useful lookup key.
     if (eventType === "Frozen" || eventType === "Unfrozen") {
-      return {
-        ledgerSequence: raw.ledger,
-        timestamp,
-        contractId: raw.contractId,
-        eventType,
-        address: null,
-        addressTo: null,
-        amount: null,
-        jurisdiction: null,
-        kind: null,
-        source: null,
-        detail: null,
-        rawTopics: JSON.stringify(raw.topic),
-        rawData: raw.value ?? "",
-      };
+      return { ...base, eventType, address: null };
     }
 
     if (!KNOWN_EVENTS.has(eventType)) return null;
+
+    if (eventType === "PolicyResult") {
+      const passed = topics[1];
+      if (passed?.type !== "Bool" || dataVal.type !== "Vec" || dataVal.value.length !== 2) return null;
+      const from = dataVal.value[0];
+      const to = dataVal.value[1];
+      if (from.type !== "Address" || to.type !== "Address") return null;
+      return {
+        ...base,
+        eventType,
+        policyFrom: from.value,
+        policyTo: to.value,
+        policyPassed: passed.value,
+      };
+    }
+
+    if (eventType === "SignerAdd" || eventType === "SignerRm") {
+      const signer = topics[1];
+      if (signer?.type !== "Address") return null;
+      return { ...base, eventType, signerAddress: signer.value };
+    }
+
+    if (eventType === "ThreshSet") {
+      if (dataVal.type !== "U32") return null;
+      return { ...base, eventType, newThreshold: dataVal.value };
+    }
+
+    if (eventType === "AuthOk") {
+      if (dataVal.type !== "Vec" || dataVal.value.length !== 2) return null;
+      const validCount = dataVal.value[0];
+      const threshold = dataVal.value[1];
+      if (validCount.type !== "U32" || threshold.type !== "U32") return null;
+      return {
+        ...base,
+        eventType,
+        validCount: validCount.value,
+        newThreshold: threshold.value,
+      };
+    }
+
+    if (eventType === "AdminSet" || eventType === "DenylistGateSet" || eventType === "JurisdictionFlagSet") {
+      const address = topics[1];
+      if (address?.type !== "Address") return null;
+      return { ...base, eventType, address: address.value };
+    }
 
     // topics[1] is always the primary address
     const addrVal = topics[1];
@@ -426,21 +504,13 @@ export function decodeEvent(
     }
 
     return {
-      ledgerSequence: raw.ledger,
-      timestamp,
-      contractId: raw.contractId,
+      ...base,
       eventType,
       address,
       addressTo,
       amount,
       jurisdiction,
-      kind: null,
-      source: null,
-      detail: null,
-      rawTopics: JSON.stringify(raw.topic),
-      rawData: raw.value ?? "",
-    } as const;
-
+    };
   } catch (err) {
     console.error(`Failed to decode event from contract ${raw.contractId}:`, err);
     return null;
