@@ -691,3 +691,92 @@ fn test_get_admin_not_initialized_returns_error() {
         "get_admin should return an error before initialization"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tests for issue #405: evaluate_verbose surfaces CheckFailure
+// ---------------------------------------------------------------------------
+
+/// `evaluate_verbose` returns `(true, None)` when all checks pass (All op).
+#[test]
+fn test_evaluate_verbose_passes_returns_none_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    let code_us = String::from_str(&env, "US");
+    MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&from, &code_us);
+    MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&to, &code_us);
+
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+
+    let (passed, failure) = client.evaluate_verbose(&from, &to);
+    assert!(passed, "expected policy to pass");
+    assert!(failure.is_none(), "expected no CheckFailure when policy passes");
+}
+
+/// `evaluate_verbose` returns `(false, Some(CheckFailure))` with the correct
+/// index and kind when the denylist check fails under All semantics.
+#[test]
+fn test_evaluate_verbose_fails_surfaces_check_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // Both addresses have valid jurisdiction codes but `from` is denied.
+    let code_us = String::from_str(&env, "US");
+    MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&from, &code_us);
+    MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&to, &code_us);
+    MockDenylistClient::new(&env, &deny_id).add_to_denylist(&from);
+
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    // Register Denylist at index 0, Jurisdiction at index 1.
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+
+    let (passed, failure) = client.evaluate_verbose(&from, &to);
+    assert!(!passed, "expected policy to fail");
+
+    let f = failure.expect("expected Some(CheckFailure) when policy fails");
+    assert_eq!(f.check_index, 0, "denylist is at index 0");
+    assert_eq!(
+        f.kind,
+        soroban_sdk::Symbol::new(&env, "Denylist"),
+        "kind should be 'Denylist'"
+    );
+}
