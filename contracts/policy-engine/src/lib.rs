@@ -765,6 +765,23 @@ impl PolicyEngine {
     // Read-only accessors
     // -----------------------------------------------------------------------
 
+    /// Returns the check at position `index` in the registered policy list,
+    /// or `Err(Error::CheckIndexOutOfRange)` if `index` is out of range.
+    ///
+    /// This is more efficient than `get_checks()` when a caller only needs a
+    /// single entry (e.g. to inspect or display the config of one rule in a
+    /// UI), because it avoids deserializing and returning the entire
+    /// `Vec<CheckKind>` — especially important as the list grows toward
+    /// `MAX_CHECKS`.
+    pub fn get_check(env: Env, index: u32) -> Result<CheckKind, Error> {
+        let checks: Vec<CheckKind> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Checks)
+            .ok_or(Error::NotInitialized)?;
+        checks.get(index).ok_or(Error::CheckIndexOutOfRange)
+    }
+
     /// Returns the current admin address, or `Err(Error::NotInitialized)` if
     /// the contract has not yet been initialized.
     ///

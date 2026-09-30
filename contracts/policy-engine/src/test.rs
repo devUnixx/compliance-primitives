@@ -780,3 +780,76 @@ fn test_evaluate_verbose_fails_surfaces_check_failure() {
         "kind should be 'Denylist'"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tests for issue #406: get_check(index) view function
+// ---------------------------------------------------------------------------
+
+/// `get_check` returns the correct `CheckKind` for a valid index.
+#[test]
+fn test_get_check_valid_index() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    // Register two checks: denylist at 0, jurisdiction at 1.
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+
+    // Fetch index 0 — should be the denylist check.
+    let check0 = client.get_check(&0);
+    match check0 {
+        CheckKind::Denylist(params) => assert_eq!(params.contract, deny_id),
+        _ => panic!("expected Denylist at index 0"),
+    }
+
+    // Fetch index 1 — should be the jurisdiction check.
+    let check1 = client.get_check(&1);
+    match check1 {
+        CheckKind::Jurisdiction(params) => {
+            assert_eq!(params.contract, juri_id);
+        }
+        _ => panic!("expected Jurisdiction at index 1"),
+    }
+}
+
+/// `get_check` returns `Err(CheckIndexOutOfRange)` for an out-of-range index.
+#[test]
+fn test_get_check_out_of_range_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    // Register one check at index 0.
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+
+    // Requesting index 1 should fail — only index 0 exists.
+    let result = client.try_get_check(&1);
+    assert!(
+        result.is_err(),
+        "expected Err(CheckIndexOutOfRange) for index 1 with only 1 check registered"
+    );
+}
