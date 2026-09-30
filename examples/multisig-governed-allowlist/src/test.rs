@@ -17,6 +17,7 @@ extern crate std;
 
 use allowlist_token::{AllowlistToken, AllowlistTokenClient};
 use multisig_admin::{MultisigAdmin, MultisigAdminClient};
+use soroban_sdk::auth::CustomAccountInterface;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{vec, Address, Env};
 
@@ -76,7 +77,7 @@ fn test_multisig_set_as_allowlist_admin() {
     let (_, allowlist_client) = setup_allowlist(&env, &multisig_id);
 
     // The admin stored in the allowlist is the multisig contract address.
-    let metadata = allowlist_client.metadata().unwrap();
+    let metadata = allowlist_client.metadata();
     assert_eq!(metadata.admin, multisig_id);
 }
 
@@ -98,7 +99,7 @@ fn test_add_to_allowlist_via_multisig_admin() {
     // Pass the multisig contract address as the `admin` argument.
     // allowlist-token calls `admin.require_auth()`, which routes to
     // `multisig-admin::__check_auth` at runtime. mock_all_auths satisfies it.
-    allowlist_client.add_to_allowlist(&multisig_id, &alice).unwrap();
+    allowlist_client.add_to_allowlist(&multisig_id, &alice, &None);
 
     assert!(allowlist_client.is_allowed(&alice));
 }
@@ -113,10 +114,10 @@ fn test_remove_from_allowlist_via_multisig_admin() {
     let (_, allowlist_client) = setup_allowlist(&env, &multisig_id);
 
     let bob = Address::generate(&env);
-    allowlist_client.add_to_allowlist(&multisig_id, &bob).unwrap();
+    allowlist_client.add_to_allowlist(&multisig_id, &bob, &None);
     assert!(allowlist_client.is_allowed(&bob));
 
-    allowlist_client.remove_from_allowlist(&multisig_id, &bob).unwrap();
+    allowlist_client.remove_from_allowlist(&multisig_id, &bob);
     assert!(!allowlist_client.is_allowed(&bob));
 }
 
@@ -133,16 +134,16 @@ fn test_multisig_can_manage_multiple_allowlist_entries() {
     let bob = Address::generate(&env);
     let charlie = Address::generate(&env);
 
-    allowlist_client.add_to_allowlist(&multisig_id, &alice).unwrap();
-    allowlist_client.add_to_allowlist(&multisig_id, &bob).unwrap();
-    allowlist_client.add_to_allowlist(&multisig_id, &charlie).unwrap();
+    allowlist_client.add_to_allowlist(&multisig_id, &alice, &None);
+    allowlist_client.add_to_allowlist(&multisig_id, &bob, &None);
+    allowlist_client.add_to_allowlist(&multisig_id, &charlie, &None);
 
     assert!(allowlist_client.is_allowed(&alice));
     assert!(allowlist_client.is_allowed(&bob));
     assert!(allowlist_client.is_allowed(&charlie));
 
     // Remove one; the others remain.
-    allowlist_client.remove_from_allowlist(&multisig_id, &bob).unwrap();
+    allowlist_client.remove_from_allowlist(&multisig_id, &bob);
     assert!(allowlist_client.is_allowed(&alice));
     assert!(!allowlist_client.is_allowed(&bob));
     assert!(allowlist_client.is_allowed(&charlie));
@@ -159,10 +160,10 @@ fn test_pause_and_unpause_via_multisig_admin() {
 
     assert!(!allowlist_client.is_paused());
 
-    allowlist_client.pause(&multisig_id).unwrap();
+    allowlist_client.pause(&multisig_id);
     assert!(allowlist_client.is_paused());
 
-    allowlist_client.unpause(&multisig_id).unwrap();
+    allowlist_client.unpause(&multisig_id);
     assert!(!allowlist_client.is_paused());
 }
 
@@ -182,12 +183,14 @@ fn test_check_auth_grants_auth_at_threshold() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (signers, _id, _client) = setup_multisig(&env, 3, 2);
+    let (signers, id, _client) = setup_multisig(&env, 3, 2);
 
     let payload: Hash<32> = env.crypto().sha256(&Bytes::from_array(&env, &[0u8; 32]));
     // Provide exactly 2 of the 3 signers — meets the threshold.
     let sigs = vec![&env, signers.get(0).unwrap(), signers.get(1).unwrap()];
-    let result = MultisigAdmin::__check_auth(env.clone(), payload, sigs, soroban_sdk::Vec::new(&env));
+    let result = env.as_contract(&id, || {
+        MultisigAdmin::__check_auth(env.clone(), payload, sigs, soroban_sdk::Vec::new(&env))
+    });
     assert!(result.is_ok(), "2-of-3 threshold should be met with 2 valid signers");
 }
 
@@ -202,12 +205,14 @@ fn test_check_auth_rejects_below_threshold() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (signers, _id, _client) = setup_multisig(&env, 3, 2);
+    let (signers, id, _client) = setup_multisig(&env, 3, 2);
 
     let payload: Hash<32> = env.crypto().sha256(&Bytes::from_array(&env, &[0u8; 32]));
     // Only 1 signer — below the 2-of-3 threshold.
     let sigs = vec![&env, signers.get(0).unwrap()];
-    let result = MultisigAdmin::__check_auth(env.clone(), payload, sigs, soroban_sdk::Vec::new(&env));
+    let result = env.as_contract(&id, || {
+        MultisigAdmin::__check_auth(env.clone(), payload, sigs, soroban_sdk::Vec::new(&env))
+    });
     assert_eq!(result, Err(Error::ThresholdNotMet));
 }
 
@@ -223,12 +228,14 @@ fn test_check_auth_outsider_does_not_count() {
     env.mock_all_auths();
 
     // 2-of-3 threshold
-    let (signers, _id, _client) = setup_multisig(&env, 3, 2);
+    let (signers, id, _client) = setup_multisig(&env, 3, 2);
 
     let payload: Hash<32> = env.crypto().sha256(&Bytes::from_array(&env, &[0u8; 32]));
     // One valid signer + one outsider — still only 1 valid approval.
     let outsider = Address::generate(&env);
     let sigs = vec![&env, signers.get(0).unwrap(), outsider];
-    let result = MultisigAdmin::__check_auth(env.clone(), payload, sigs, soroban_sdk::Vec::new(&env));
+    let result = env.as_contract(&id, || {
+        MultisigAdmin::__check_auth(env.clone(), payload, sigs, soroban_sdk::Vec::new(&env))
+    });
     assert_eq!(result, Err(Error::ThresholdNotMet));
 }
