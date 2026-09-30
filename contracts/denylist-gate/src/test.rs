@@ -478,6 +478,120 @@ fn test_multisig_remove_signer_fails_if_only_one() {
     assert_eq!(result, Err(Ok(Error::InvalidSignerSet)));
 }
 
+// ---------------------------------------------------------------------------
+// Admin transfer (#19)
+// ---------------------------------------------------------------------------
+
+mod admin_transfer {
+    use super::setup;
+    use crate::{DenylistGate, DenylistGateClient, Error};
+    use soroban_sdk::testutils::{Address as _, Events as _};
+    use soroban_sdk::{vec, Address, Env, IntoVal, Map, Symbol, Val};
+
+    #[test]
+    fn test_transfer_admin_emits_event_and_hands_over_control() {
+        let env = Env::default();
+        let (admin, contract_id, client) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        client.transfer_admin(&admin, &new_admin);
+
+        assert_eq!(
+            env.events().all(),
+            vec![
+                &env,
+                (
+                    contract_id.clone(),
+                    (
+                        Symbol::new(&env, "admin_transferred"),
+                        admin.clone(),
+                        new_admin.clone(),
+                    )
+                        .into_val(&env),
+                    Map::<Symbol, Val>::new(&env).into_val(&env),
+                ),
+            ]
+        );
+
+        let mallory = Address::generate(&env);
+        client.add_to_denylist(&new_admin, &mallory);
+        assert!(!client.check(&mallory));
+    }
+
+    #[test]
+    fn test_transfer_admin_rejects_non_admin() {
+        let env = Env::default();
+        let (admin, _contract_id, client) = setup(&env);
+        let impostor = Address::generate(&env);
+
+        let result = client.try_transfer_admin(&impostor, &impostor);
+        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+
+        // The real admin is unchanged and still in control.
+        let mallory = Address::generate(&env);
+        client.add_to_denylist(&admin, &mallory);
+        assert!(!client.check(&mallory));
+        assert_eq!(
+            client.try_add_to_denylist(&impostor, &mallory),
+            Err(Ok(Error::NotAuthorized))
+        );
+    }
+
+    #[test]
+    fn test_transfer_admin_revokes_old_admin_immediately() {
+        let env = Env::default();
+        let (old_admin, _contract_id, client) = setup(&env);
+        let new_admin = Address::generate(&env);
+        let mallory = Address::generate(&env);
+
+        client.transfer_admin(&old_admin, &new_admin);
+
+        assert_eq!(
+            client.try_add_to_denylist(&old_admin, &mallory),
+            Err(Ok(Error::NotAuthorized))
+        );
+        assert_eq!(
+            client.try_remove_from_denylist(&old_admin, &mallory),
+            Err(Ok(Error::NotAuthorized))
+        );
+        assert_eq!(client.try_pause(&old_admin), Err(Ok(Error::NotAuthorized)));
+        assert_eq!(
+            client.try_transfer_admin(&old_admin, &old_admin),
+            Err(Ok(Error::NotAuthorized))
+        );
+        assert!(client.check(&mallory));
+    }
+
+    #[test]
+    fn test_transfer_admin_works_while_paused() {
+        let env = Env::default();
+        let (admin, _contract_id, client) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        client.pause(&admin);
+        client.transfer_admin(&admin, &new_admin);
+        client.unpause(&new_admin);
+
+        let mallory = Address::generate(&env);
+        client.add_to_denylist(&new_admin, &mallory);
+        assert!(!client.check(&mallory));
+    }
+
+    #[test]
+    fn test_transfer_admin_fails_before_initialize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(DenylistGate, ());
+        let client = DenylistGateClient::new(&env, &contract_id);
+        let someone = Address::generate(&env);
+
+        assert_eq!(
+            client.try_transfer_admin(&someone, &someone),
+            Err(Ok(Error::NotInitialized))
+        );
+    }
+}
+
 #[test]
 fn test_add_and_remove_without_audit_log_is_unchanged() {
     let env = Env::default();

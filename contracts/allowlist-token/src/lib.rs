@@ -242,7 +242,34 @@ impl AllowlistToken {
         Ok(())
     }
 
-    /// Propose a two-step upgrade to `new_wasm` (the replacement contract Wasm).
+    /// Immediately reassign the admin role to `new_admin`. Requires auth from
+    /// `current_admin`, which must be the stored admin.
+    ///
+    /// Unlike `propose_admin` / `accept_admin`, this is single-step: the old
+    /// admin loses all privileges as soon as this call succeeds, and any
+    /// pending two-step proposal is cleared. Prefer the two-step flow when
+    /// `new_admin`'s key has not yet been proven to work; use this one when
+    /// the current key must be rotated out right away.
+    ///
+    /// Emits `AdminTransferred { old_admin, new_admin }`.
+    pub fn transfer_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &current_admin)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        AdminTransferred {
+            old_admin: current_admin,
+            new_admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Propose a two-step upgrade to `new_wasm_hash` (the hash of the
+    /// already-uploaded replacement contract Wasm).
     ///
     /// Admin-only. The upgrade does **not** take effect immediately: it becomes
     /// committable only once the ledger sequence reaches `activated_at`, which
@@ -270,7 +297,7 @@ impl AllowlistToken {
         Ok(())
     }
 
-    /// Commit a previously proposed upgrade, installing `new_wasm`.
+    /// Commit a previously proposed upgrade, installing `new_wasm_hash`.
     ///
     /// Admin-only. Errors with `UpgradeNotReady` if no upgrade is pending or if
     /// the current ledger has not yet reached `activated_at`.
@@ -299,7 +326,7 @@ impl AllowlistToken {
     }
 
     /// Current on-chain schema version (see [`SCHEMA_VERSION`]).
-    pub fn schema_version(env: Env) -> u32 {
+    pub fn schema_version(_env: Env) -> u32 {
         SCHEMA_VERSION
     }
 

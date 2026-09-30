@@ -10,6 +10,16 @@
 //! matching — it returns `true` if at least one of the address's codes
 //! appears in `allowed_codes`. An address with no codes is never permitted.
 //!
+//! **Code format**: `set_jurisdiction` only accepts ISO 3166-1 alpha-2 codes
+//! written as exactly two *uppercase* ASCII letters (`"US"`, `"GB"`, …).
+//! Anything else — empty, too short/long, lowercase (`"us"`), or containing
+//! non-letters (`"U1"`, `"U-"`) — is rejected with
+//! `Error::InvalidJurisdictionCode`. Codes are never normalized: matching in
+//! `is_permitted_jurisdiction` stays exact and case-sensitive (#54), so
+//! requiring the canonical uppercase form on write guarantees an address
+//! can't be flagged as `"us"` and then silently fail to match an
+//! `allowed_codes` entry of `"US"`.
+//!
 //! **Callers**: the configured issuer or compliance officer may call
 //! `set_jurisdiction` and `add_jurisdiction`; only the issuer may call
 //! `remove_jurisdiction`, `remove_jurisdiction_multiple`, or `upgrade`.
@@ -23,6 +33,9 @@ use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
     String, Vec,
 };
+
+/// Length in bytes of an ISO 3166-1 alpha-2 code.
+const JURISDICTION_CODE_LEN: u32 = 2;
 
 /// Extend persistent jurisdiction entries when TTL drops below this many ledgers.
 const TTL_THRESHOLD: u32 = 1_000;
@@ -54,6 +67,15 @@ pub struct JurisdictionRemoved {
     pub address: Address,
 }
 
+/// Emitted when the issuer role is reassigned via `transfer_issuer`.
+#[contractevent]
+pub struct IssuerTransferred {
+    #[topic]
+    pub old_issuer: Address,
+    #[topic]
+    pub new_issuer: Address,
+}
+
 #[contractevent]
 pub struct Paused {
     #[topic]
@@ -76,6 +98,10 @@ pub enum Error {
     /// Caller supplied an argument that is structurally invalid.
     InvalidInput = 4,
     ContractPaused = 5,
+    /// `set_jurisdiction` was given a `code` that is not exactly two
+    /// uppercase ASCII letters (ISO 3166-1 alpha-2). Also covers the empty
+    /// string (#81), so there is one variant for every malformed code.
+    InvalidJurisdictionCode = 6,
 }
 
 #[contract]
@@ -104,6 +130,31 @@ impl JurisdictionFlag {
         issuer.require_auth();
         env.storage().instance().set(&DataKey::Issuer, &issuer);
         env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    /// Reassign the issuer role to `new_issuer`. Requires auth from
+    /// `current_issuer`, which must be the stored issuer.
+    ///
+    /// Takes effect immediately: the old issuer loses all privileges
+    /// (including `upgrade`, `pause`, and managing the compliance officer)
+    /// as soon as this call succeeds. The compliance-officer assignment is
+    /// left untouched. Deliberately *not* blocked by `pause`, so a
+    /// compromised or rotated issuer key can always be replaced.
+    ///
+    /// Emits `IssuerTransferred { old_issuer, new_issuer }`.
+    pub fn transfer_issuer(
+        env: Env,
+        current_issuer: Address,
+        new_issuer: Address,
+    ) -> Result<(), Error> {
+        Self::require_issuer(&env, &current_issuer)?;
+        env.storage().instance().set(&DataKey::Issuer, &new_issuer);
+        IssuerTransferred {
+            old_issuer: current_issuer,
+            new_issuer,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -186,6 +237,10 @@ impl JurisdictionFlag {
 
     /// Attach jurisdiction `code` to `address`. Issuer or compliance-officer.
     ///
+    /// `code` must be an ISO 3166-1 alpha-2 code in canonical uppercase form
+    /// (see the module docs); otherwise returns
+    /// `Error::InvalidJurisdictionCode` and nothing is stored.
+    ///
     /// Auth: gated by [`require_compliance_authority`] — allows either the issuer or a
     /// delegated compliance officer, so routine flag management does not require the issuer key.
     pub fn set_jurisdiction(
@@ -195,6 +250,7 @@ impl JurisdictionFlag {
         code: String,
     ) -> Result<(), Error> {
         Self::require_compliance_authority(&env, &issuer)?;
+        Self::validate_jurisdiction_code(&code)?;
 
         let mut codes = Vec::new(&env);
         codes.push_back(code.clone());
@@ -217,6 +273,7 @@ impl JurisdictionFlag {
         code: String,
     ) -> Result<(), Error> {
         Self::require_compliance_authority(&env, &issuer)?;
+        Self::validate_jurisdiction_code(&code)?;
 
         let mut codes = Self::load_jurisdictions(&env, &address);
         if !codes.iter().any(|existing| existing == code) {
@@ -415,6 +472,19 @@ impl JurisdictionFlag {
             }
         }
         Err(Error::NotAuthorized)
+    }
+
+    /// Accepts only exactly two uppercase ASCII letters (`A`–`Z`).
+    fn validate_jurisdiction_code(code: &String) -> Result<(), Error> {
+        if code.len() != JURISDICTION_CODE_LEN {
+            return Err(Error::InvalidJurisdictionCode);
+        }
+        let mut buf = [0u8; JURISDICTION_CODE_LEN as usize];
+        code.copy_into_slice(&mut buf);
+        if !buf.iter().all(u8::is_ascii_uppercase) {
+            return Err(Error::InvalidJurisdictionCode);
+        }
+        Ok(())
     }
 
     fn extend_jurisdiction_ttl(env: &Env, key: &DataKey) {

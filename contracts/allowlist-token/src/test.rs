@@ -480,6 +480,113 @@ fn prop_allowlist_add_remove_last_write_wins() {
         .unwrap();
 }
 
+// ─── Admin transfer (#19) ────────────────────────────────────────────────────
+
+mod admin_transfer {
+    use super::setup;
+    use crate::{AllowlistToken, AllowlistTokenClient, Error};
+    use soroban_sdk::testutils::{Address as _, Events as _};
+    use soroban_sdk::{vec, Address, Env, IntoVal, Map, Symbol, Val};
+
+    #[test]
+    fn test_transfer_admin_reassigns_admin_and_emits_event() {
+        let env = Env::default();
+        let (admin, _token_id, contract_id, client) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        client.transfer_admin(&admin, &new_admin);
+
+        assert_eq!(
+            env.events().all(),
+            vec![
+                &env,
+                (
+                    contract_id.clone(),
+                    (
+                        Symbol::new(&env, "admin_transferred"),
+                        admin.clone(),
+                        new_admin.clone(),
+                    )
+                        .into_val(&env),
+                    Map::<Symbol, Val>::new(&env).into_val(&env),
+                ),
+            ]
+        );
+        assert_eq!(client.metadata().admin, new_admin);
+    }
+
+    #[test]
+    fn test_transfer_admin_rejects_non_admin() {
+        let env = Env::default();
+        let (admin, _token_id, _contract_id, client) = setup(&env);
+        let impostor = Address::generate(&env);
+
+        let result = client.try_transfer_admin(&impostor, &impostor);
+        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+
+        // The real admin is unchanged and still in control.
+        assert_eq!(client.metadata().admin, admin);
+        let alice = Address::generate(&env);
+        client.add_to_allowlist(&admin, &alice, &None);
+        assert!(client.is_allowed(&alice));
+    }
+
+    #[test]
+    fn test_transfer_admin_revokes_old_admin_immediately() {
+        let env = Env::default();
+        let (old_admin, _token_id, _contract_id, client) = setup(&env);
+        let new_admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+
+        client.transfer_admin(&old_admin, &new_admin);
+
+        assert_eq!(
+            client.try_add_to_allowlist(&old_admin, &alice, &None),
+            Err(Ok(Error::NotAuthorized))
+        );
+        assert_eq!(client.try_pause(&old_admin), Err(Ok(Error::NotAuthorized)));
+        assert_eq!(
+            client.try_transfer_admin(&old_admin, &old_admin),
+            Err(Ok(Error::NotAuthorized))
+        );
+        assert!(!client.is_allowed(&alice));
+
+        client.add_to_allowlist(&new_admin, &alice, &None);
+        assert!(client.is_allowed(&alice));
+    }
+
+    #[test]
+    fn test_transfer_admin_clears_pending_two_step_proposal() {
+        let env = Env::default();
+        let (admin, _token_id, _contract_id, client) = setup(&env);
+        let proposed = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin(&admin, &proposed);
+        client.transfer_admin(&admin, &new_admin);
+
+        assert_eq!(
+            client.try_accept_admin(&proposed),
+            Err(Ok(Error::NoPendingAdmin))
+        );
+        assert_eq!(client.metadata().admin, new_admin);
+    }
+
+    #[test]
+    fn test_transfer_admin_fails_before_initialize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AllowlistToken, ());
+        let client = AllowlistTokenClient::new(&env, &contract_id);
+        let someone = Address::generate(&env);
+
+        assert_eq!(
+            client.try_transfer_admin(&someone, &someone),
+            Err(Ok(Error::NotInitialized))
+        );
+    }
+}
+
 // ─── Allowlist expiry (#21) ──────────────────────────────────────────────────
 
 /// Pin the ledger to a known sequence with TTLs generous enough that neither

@@ -85,6 +85,14 @@ pub struct DenyRemove {
     pub address: Address,
 }
 
+#[contractevent]
+pub struct AdminTransferred {
+    #[topic]
+    pub old_admin: Address,
+    #[topic]
+    pub new_admin: Address,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -156,7 +164,31 @@ impl DenylistGate {
         Ok(())
     }
 
-    /// Propose a two-step upgrade to `new_wasm` (the replacement contract Wasm).
+    /// Reassign the admin role to `new_admin`. Requires auth from
+    /// `current_admin`, which must be the stored admin.
+    ///
+    /// Takes effect immediately: the old admin loses all privileges as soon
+    /// as this call succeeds. Deliberately *not* blocked by `pause`, so a
+    /// compromised or rotated admin key can always be replaced.
+    ///
+    /// Emits `AdminTransferred { old_admin, new_admin }`.
+    pub fn transfer_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &current_admin)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        AdminTransferred {
+            old_admin: current_admin,
+            new_admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Propose a two-step upgrade to `new_wasm_hash` (the hash of the
+    /// already-uploaded replacement contract Wasm).
     ///
     /// Admin-only. The upgrade does **not** take effect immediately: it becomes
     /// committable only once the ledger sequence reaches `activated_at`, which
@@ -184,7 +216,7 @@ impl DenylistGate {
         Ok(())
     }
 
-    /// Commit a previously proposed upgrade, installing `new_wasm`.
+    /// Commit a previously proposed upgrade, installing `new_wasm_hash`.
     ///
     /// Admin-only. Errors with `UpgradeNotReady` if no upgrade is pending or if
     /// the current ledger has not yet reached `activated_at`.
