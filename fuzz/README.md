@@ -44,6 +44,16 @@ Run this after non-trivial changes to `set_jurisdiction` /
 `get_jurisdiction` / `is_permitted_jurisdiction`, or as part of a release
 checklist. Failures print the failing `seed` so the sequence is reproducible.
 
+Multi-code add/remove operations are also fuzzed against a fixed code-pool
+set model:
+
+```sh
+cargo test -p jurisdiction-flag fuzz_jurisdiction_multicode_add_remove_sequences -- --nocapture
+```
+
+This target uses the same `FUZZ_ITERATIONS` and `FUZZ_OPS` controls and checks
+that each operation leaves `list_jurisdictions` equal to the modeled set.
+
 ## circuit-breaker × denylist-gate-consumer (`#465`)
 
 Harness: `examples/denylist-gate-consumer/src/fuzz_test.rs`
