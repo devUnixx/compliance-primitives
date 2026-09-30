@@ -153,6 +153,16 @@ loop to print the operation sequence and state at the point of failure.
   (e.g. a blocked transfer), don't put it behind a code path that would
   cause the whole invocation to revert — Soroban rolls back events emitted
   during any invocation that ultimately fails.
+- **`#[contracttype]` enum variants must be unit or single-tuple — not
+  named-field variants.** The pinned Soroban SDK version encodes enums as
+  XDR tagged unions; named-field variants (`Foo { bar: T, baz: U }`) are
+  not supported and will fail to compile. If a new enum variant needs more
+  than one field, define a separate `#[contracttype]` struct for those
+  fields and wrap it in a single-tuple variant — exactly the pattern used
+  by `CheckKind::Jurisdiction(JurisdictionCheck { ... })` in
+  `contracts/policy-engine`. Do not attempt to "simplify" these wrapper
+  structs back into named-field variants without first verifying that the
+  pinned SDK version supports them.
 
 ## Verifying reproducible builds
 
