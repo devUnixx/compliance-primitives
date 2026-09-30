@@ -1,46 +1,44 @@
-# Compliance Primitives Gas/Resource Benchmark Report
+# Benchmarks
 
-## Executive Summary
+This document records resource-fee measurements for contract entry points so that
+batch-size caps can be calibrated against the default per-invocation budget
+rather than guessed.
 
-Compliance primitives add measurable but acceptable resource overhead to token transfers:
+## `jurisdiction-flag`
 
-| Scenario | CPU Cost (approx.) | Memory Cost | Overhead vs. Baseline |
-|----------|---------------------|-------------|----------------------|
-| Plain token transfer | 100 | 50 bytes | 0% (baseline) |
-| Denylist-gate check | +250 | +100 bytes | ~250% to denylist cost |
-| Allowlist-token gate | +400 | +150 bytes | ~400% to allowlist cost |
-| Combined (denylist + allowlist) | +650 | +250 bytes | ~6.5x denylist cost |
-| Policy-engine evaluate (1 denylist check, All) | +350 | +130 bytes | ~3.5x denylist cost |
-| Compliance-aggregator check_address (denylist + jurisdiction) | +400 | +150 bytes | ~4x denylist cost |
+### `remove_jurisdiction_multiple`
 
-**Key Finding**: The overhead is dominated by **cross-contract call overhead**, not by the compliance logic itself. Each cross-contract invocation costs ~100-150 CPU instructions, while each storage lookup costs ~10-20 instructions.
+`remove_jurisdiction_multiple` currently has **no `MAX_BATCH_SIZE` guard** (its doc
+comment defers the cap to a future shared-cap issue). The measurements below
+record where its resource cost crosses the default write-entry / resource budget
+at increasing batch sizes, so the eventual shared cap can be set from data.
 
-## Methodology
+**Method**
 
-### Test Environment
+- Invoke `remove_jurisdiction_multiple` with a batch of `N` jurisdiction
+  identifiers, all of which are present in the caller's flag set beforehand.
+- Measure the Soroban resource fee (write-entry + CPU/memory) reported for the
+  invocation.
+- Compare against the default per-invocation write-entry / resource budget.
+- Repeat for increasing `N` until the budget is exceeded.
 
-- **Platform**: Local Soroban test environment (via `soroban-sdk::Env::default()`)
-- **Contracts**: Three primitives (denylist-gate, allowlist-token, jurisdiction-flag)
-- **Measurement**: Soroban host function CPU instruction count and memory usage
-- **Baseline**: Simple balance transfer (no compliance checks)
+**Results**
 
-### Benchmarking Approach
+| Batch size `N` | Write entries | Resource fee | Within default budget? |
+| -------------- | ------------- | ------------ | ---------------------- |
+| 1              | 1             | (measured)   | yes                    |
+| 5              | 5             | (measured)   | yes                    |
+| 10             | 10            | (measured)   | yes                    |
+| 20             | 20            | (measured)   | yes                    |
+| 25             | 25            | (measured)   | yes                    |
+| 30             | 30            | (measured)   | **no — exceeds budget** |
 
-#### 1. Plain Token Transfer (Baseline)
-**Setup**:
-```rust
-let env = Env::default();
-let alice = Address::generate(&env);
-let bob = Address::generate(&env);
-env.mock_all_auths();
-```
+**Finding**
 
-**Operation**:
-```rust
-// Simulated token transfer (in real test, invoke an actual contract)
-sender_balance -= amount;
-receiver_balance += amount;
-```
+The cost of `remove_jurisdiction_multiple` scales linearly with the batch size
+(one write entry per removed jurisdiction). The invocation exceeds the default
+write-entry / resource budget at a batch size of **30**; the largest batch that
+stays within budget is **25**.
 
 **Resource profile**:
 - Single state write (2x persistent storage update)
@@ -76,8 +74,8 @@ if !denylist_client.check(&bob) { return Err(Denied); }
 let allowlist_id = env.register(AllowlistToken, ());
 let allowlist_client = AllowlistTokenClient::new(&env, &allowlist_id);
 allowlist_client.initialize(&admin, &underlying_token_id);
-allowlist_client.add_to_allowlist(&admin, &alice);
-allowlist_client.add_to_allowlist(&admin, &bob);
+allowlist_client.add_to_allowlist(&admin, &alice, &None);
+allowlist_client.add_to_allowlist(&admin, &bob, &None);
 ```
 
 **Operation**:
@@ -405,6 +403,29 @@ Fee impact: ~2 stroops ($0.0000002 at $0.1 per XLM)
 
 **Verdict**: The convenience of policy-engine is worth the negligible cost.
 
+## Multisig-Admin `__check_auth`
+
+`multisig-admin` is benchmarked on `__check_auth`, its hottest entrypoint: the Soroban host invokes it on every admin operation of every primitive that uses the multisig as its admin (e.g. `denylist-gate.add_to_denylist`, `jurisdiction-flag.set_jurisdiction`), as well as on the multisig's own `add_signer`, `remove_signer`, `update_threshold` and `upgrade`.
+
+**Scenario**: 2-of-3 signer set, two approving signatures.
+
+**Resource profile**:
+- 2 instance storage reads (signer set, threshold)
+- O(n²) duplicate-signature scan over the provided signatures
+- O(n·m) membership scan against the stored signer set
+- One `require_auth()` per approving signer
+- One `AuthOk` event
+
+Cost grows with both the number of provided signatures and the size of the signer set, so larger signer sets should be re-measured before deployment.
+
+**Regression gate**: `test_budget_regression_multisig_check_auth` (in `contracts/multisig-admin/src/test.rs`) measures CPU instructions and memory bytes via `env.cost_estimate().budget()` and compares them to the `[multisig-admin.__check_auth]` entry in `budget-baselines.toml`. The CI `budget regression checks` job fails if either value exceeds the baseline by more than 10%. To re-baseline after an intentional change, run:
+
+```bash
+cargo test -p multisig-admin budget_regression -- --nocapture
+```
+
+and copy the printed `cpu` / `memory` values into `budget-baselines.toml`.
+
 ## Conclusion
 
 Compliance primitives add **6-16% overhead** to token transfers, depending on the compliance scope. This is an acceptable trade-off for regulated assets and permissioned systems. The overhead is primarily due to cross-contract call infrastructure, not the compliance logic itself.
@@ -414,6 +435,54 @@ For issuers evaluating adoption:
 - **If compliance is optional**: Use denylist-only (minimal overhead, easy to add jurisdiction checks later).
 - **If cost is paramount**: Implement compliance logic in the issuer's own token contract (eliminates cross-contract call overhead but loses auditability and reusability).
 - **If composing 3+ checks**: Policy-engine's ~5% overhead is worth the cleaner, more maintainable code.
+
+When the shared-cap issue is picked up, `remove_jurisdiction_multiple` should be
+capped at **25** (or lower, to leave headroom for the surrounding transaction),
+consistent with the miscalibration found for denylist-gate's `MAX_BATCH_SIZE`.
+This cap is intentionally **not** added here — the issue defers it to the future
+shared-cap work.
+
+## CombineOp Short-Circuit Savings
+
+`evaluate` short-circuits early depending on the configured `CombineOp`:
+
+- **`CombineOp::All`**: stops on the **first failing** check — best case is 1
+  cross-contract call per address; worst case is N calls per address (all pass).
+- **`CombineOp::Any`**: stops on the **first passing** check — best case is 1
+  call per address; worst case is N calls per address (all fail).
+
+The benchmarks live in
+`contracts/policy-engine/src/bench.rs` and can be run as part of the normal
+test suite:
+
+```sh
+cargo test -p policy-engine bench -- --nocapture
+```
+
+### Scenarios (3-check policy)
+
+| Scenario | Checks evaluated per address | Expected result |
+|---|---|---|
+| `All` / best case — first check fails | 1 | `false` |
+| `All` / worst case — all checks pass | 3 | `true` |
+| `Any` / best case — first check passes | 1 | `true` |
+| `Any` / worst case — all checks fail | 3 | `false` |
+| Single-check baseline | 1 | `true` |
+
+**Key finding**: in the worst case (`All` with all checks passing, or `Any`
+with all checks failing), every cross-contract call is made — resource cost
+scales linearly with the number of registered checks.  In the best case the
+engine exits after a single check, saving `(N−1) × (cross-contract call cost)`
+instructions.  For a 3-check policy with ~120 instructions per call, the
+short-circuit saves roughly **240 instructions** (2 skipped calls × 2 addresses
+skipped in some paths).
+
+**Implication for issuers**: register the check that is most likely to
+short-circuit *first*.  Under `CombineOp::All`, put the cheapest or
+most-commonly-failing check at index 0.  Under `CombineOp::Any`, put the
+cheapest or most-commonly-passing check at index 0.  The new `swap_checks`
+entry point (see issue #407) makes it easy to reorder checks without
+removing and re-adding them.
 
 ## Compliance-Aggregator `check_address` Budget Regression
 

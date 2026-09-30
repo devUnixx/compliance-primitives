@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **multisig-admin**: Instance TTL is extended on every write path
   (`INSTANCE_TTL_THRESHOLD` / `INSTANCE_TTL_EXTEND_TO`), with tests that
   advance the ledger past the original TTL (#198)
+- **multisig-admin**: `upgrade(new_wasm_hash)` entrypoint, gated by the M-of-N
+  threshold, with a migration test confirming state survives the upgrade
+- **multisig-admin**: `__check_auth` resource-fee benchmark and
+  `[multisig-admin.__check_auth]` baseline in `budget-baselines.toml`
+- **policy-engine**: Instance-storage TTL extension on every write path
+  (threshold ~7 days, extend-to ~90 days)
+
+### Changed
+
+- **policy-engine**: Expanded module-level docs covering purpose, callers,
+  composition with the other contracts, and the TTL policy
 
 ## [0.1.0] — 2026-08-27
 

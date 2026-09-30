@@ -112,6 +112,48 @@ pub trait CircuitBreakerInterface {
 }
 
 // ---------------------------------------------------------------------------
+// TTL policy
+// ---------------------------------------------------------------------------
+
+/// TTL policy for this contract's stored state.
+///
+/// Every piece of configuration the aggregator keeps (`Admin`,
+/// `DenylistGate`, `JurisdictionFlag`, `CircuitBreaker`, and the pause flag)
+/// lives in **instance** storage, which shares a single TTL with the contract
+/// instance itself. If that TTL lapses the whole contract is archived and
+/// every call fails until someone submits a manual restore.
+///
+/// To prevent that, every write path calls [`extend_instance_ttl`], which
+/// bumps the instance TTL back up to [`INSTANCE_TTL_EXTEND_TO`] whenever the
+/// remaining TTL has fallen below [`INSTANCE_TTL_THRESHOLD`]. The values
+/// mirror `allowlist-token`'s persistent-entry policy:
+///
+/// | Constant                  | Ledgers     | ~Wall-clock (5s/ledger) |
+/// |---------------------------|-------------|-------------------------|
+/// | `INSTANCE_TTL_THRESHOLD`  | `120_960`   | ~7 days                 |
+/// | `INSTANCE_TTL_EXTEND_TO`  | `1_555_200` | ~90 days                |
+///
+/// So as long as the contract is written to at least once every ~83 days
+/// (90 − 7), its state never becomes archived. Extending only below the
+/// threshold keeps the per-write rent cost to at most one bump per ~83 days.
+///
+/// Extend the instance TTL when its remaining TTL drops below this many
+/// ledgers (~7 days at ~5s/ledger on mainnet).
+pub(crate) const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+
+/// Target remaining instance TTL after extension (~90 days at ~5s/ledger).
+pub(crate) const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+
+/// Bump the contract instance TTL (and therefore every instance-storage
+/// entry) according to the policy documented above. Called from every
+/// storage write path.
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+}
+
+// ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
 
@@ -213,6 +255,7 @@ pub enum Error {
     NoChecksRegistered = 4,
     EmptyAddressList = 5,
     BatchTooLarge = 6,
+    ContractPaused = 7,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +315,7 @@ impl ComplianceAggregator {
                 .set(&DataKey::CircuitBreaker, &breaker);
             CircuitBreakerSet { breaker }.publish(&env);
         }
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -279,6 +323,7 @@ impl ComplianceAggregator {
     pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         compliance_pausable::pause(&env);
+        extend_instance_ttl(&env);
         env.events().publish((), soroban_sdk::symbol_short!("Paused"));
         Ok(())
     }
@@ -287,6 +332,7 @@ impl ComplianceAggregator {
     pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         compliance_pausable::unpause(&env);
+        extend_instance_ttl(&env);
         env.events().publish((), soroban_sdk::symbol_short!("Unpaused"));
         Ok(())
     }
@@ -305,6 +351,7 @@ impl ComplianceAggregator {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        extend_instance_ttl(&env);
         AdminSet { admin: new_admin }.publish(&env);
         Ok(())
     }
@@ -314,6 +361,7 @@ impl ComplianceAggregator {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::DenylistGate, &gate);
+        extend_instance_ttl(&env);
         DenylistGateSet { gate }.publish(&env);
         Ok(())
     }
@@ -325,6 +373,7 @@ impl ComplianceAggregator {
         env.storage()
             .instance()
             .set(&DataKey::JurisdictionFlag, &flag);
+        extend_instance_ttl(&env);
         JurisdictionFlagSet { flag }.publish(&env);
         Ok(())
     }
@@ -336,6 +385,7 @@ impl ComplianceAggregator {
         env.storage()
             .instance()
             .set(&DataKey::CircuitBreaker, &breaker);
+        extend_instance_ttl(&env);
         CircuitBreakerSet { breaker }.publish(&env);
         Ok(())
     }
@@ -370,6 +420,20 @@ impl ComplianceAggregator {
     /// Returns the currently registered `jurisdiction-flag` address, if any.
     pub fn jurisdiction_flag(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::JurisdictionFlag)
+    }
+
+    /// Returns whether a denylist-gate check and/or a jurisdiction-flag check
+    /// are configured without requiring two separate view calls.
+    pub fn get_checks_summary(env: Env) -> (bool, bool) {
+        let denylist_gate: Option<Address> = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::DenylistGate);
+        let jurisdiction_flag: Option<Address> = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::JurisdictionFlag);
+        (denylist_gate.is_some(), jurisdiction_flag.is_some())
     }
 
     /// Returns the currently registered `circuit-breaker` address, if any.
