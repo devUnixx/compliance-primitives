@@ -1,6 +1,49 @@
 //! `policy-engine` is a `#![no_std]` Soroban contract that composes multiple
 //! compliance checks into a single policy evaluation call.
 //!
+//! ## Purpose
+//!
+//! Each compliance primitive in this workspace answers one narrow question
+//! about an address ("is it denylisted?", "is it in a permitted
+//! jurisdiction?", "is it allowlisted?"). Real issuance policies are rarely
+//! that narrow: they combine several of those answers with AND / OR logic
+//! and must be changeable as regulation evolves. `policy-engine` holds that
+//! composition on-chain, so a token contract makes **one** call —
+//! `evaluate(from, to)` — and gets back a single pass/fail decision for the
+//! whole policy, instead of hard-coding a sequence of cross-contract calls
+//! that would need a redeploy every time the policy changes.
+//!
+//! ## Who calls it
+//!
+//! - **Token / transfer contracts** (the primary callers) invoke
+//!   `evaluate(from, to)` or `batch_evaluate(pairs)` before moving value and
+//!   refuse the transfer when the result is `false`. These calls are
+//!   permissionless and require no auth.
+//! - **The policy admin** (an issuer key or, preferably, a `multisig-admin`
+//!   contract address) calls `initialize`, `add_check`, `remove_check` and
+//!   `set_circuit_breaker` to manage the policy. Every mutation requires the
+//!   stored admin's auth.
+//! - **Off-chain tooling and auditors** call the read-only views
+//!   (`get_checks`, `get_op`, `get_policy`, `circuit_breaker`) and consume
+//!   the `PolicyResult` event stream to reconstruct every decision.
+//!
+//! ## How it composes with the other contracts
+//!
+//! | Contract | Relationship to `policy-engine` |
+//! |---|---|
+//! | `denylist-gate` | Registered as a [`CheckKind::Denylist`] check; `evaluate` calls its `check(address)`. |
+//! | `jurisdiction-flag` | Registered as a [`CheckKind::Jurisdiction`] check; `evaluate` calls `is_permitted_jurisdiction(address, allowed_codes)`. |
+//! | `allowlist-token` | Registered as a [`CheckKind::Allowlist`] check; `evaluate` calls its `is_allowed(address)`. |
+//! | `circuit-breaker` | Optional emergency stop. When configured and frozen, `evaluate` denies outright without running any check. |
+//! | `multisig-admin` | Recommended value for the `admin` address, so policy changes require M-of-N approval via `__check_auth`. |
+//! | `pausable` | Shared crate used to guard admin mutations (`add_check`, `remove_check`) while the contract is paused. |
+//! | `audit-log` | Complementary: integrators that need an on-chain, contract-readable trail of policy changes record them there; `policy-engine` itself only emits events. |
+//! | `compliance-aggregator` | Sibling, not a dependency. The aggregator is a fixed AND-only fan-out optimised for call overhead; `policy-engine` is the configurable AND / OR layer. Pick one per integration. |
+//!
+//! The primitives are called through locally declared `#[contractclient]`
+//! interfaces rather than direct crate dependencies, so any contract that
+//! exposes the same function signature can be plugged in as a check.
+//!
 //! ## AND / OR design choice
 //!
 //! Compliance use cases almost always reduce to one of two logical shapes:
@@ -39,6 +82,18 @@
 //! untouched by the WASM swap, so all state is preserved and the contract
 //! remains fully callable immediately after the upgrade. Only the admin can
 //! call `upgrade`; any other caller is rejected with `Error::NotAuthorized`.
+//!
+//! ## Storage and TTL policy
+//!
+//! All state (admin, `CombineOp`, the `Checks` vec and the optional
+//! circuit-breaker address) lives in **instance** storage, which shares a
+//! single TTL with the contract instance itself. Every write path
+//! (`initialize`, `set_circuit_breaker`, `add_check`, `remove_check`)
+//! finishes by extending that TTL: whenever the remaining TTL has dropped
+//! below [`INSTANCE_TTL_THRESHOLD`] (~7 days) it is bumped back up to
+//! [`INSTANCE_TTL_EXTEND_TO`] (~90 days). This keeps the policy from being
+//! archived by Soroban state expiration — an archived policy would make
+//! `evaluate` unreachable until a manual restore.
 #![no_std]
 
 use soroban_sdk::{
@@ -74,9 +129,8 @@ pub trait CircuitBreakerInterface {
     fn is_frozen(env: Env) -> bool;
 }
 
-/// Describes the `allowlist-token` contract interface used for cross-contract
-/// calls. The generated `AllowlistCheckClient` is used in `run_check` to call
-/// `is_allowed()` on a deployed allowlist-token instance.
+/// Describes the `allowlist-token` contract interface used for the policy
+/// engine's allowlist check.
 #[contractclient(name = "AllowlistCheckClient")]
 pub trait AllowlistCheckInterface {
     fn is_allowed(env: Env, address: Address) -> bool;
@@ -133,8 +187,47 @@ pub struct CircuitBreakerCheck {
 /// Each variant carries the address of the external contract that implements
 /// the check plus any parameters that check needs.
 ///
-/// Note: `#[contracttype]` only supports tuple variants (not named struct
-/// variants). Each variant wraps a dedicated parameter struct.
+/// ## `#[contracttype]` enum variant shape restriction
+///
+/// The Soroban SDK's `#[contracttype]` macro (pinned in this workspace) only
+/// supports **unit** or **single-tuple** enum variants. Named-field variants
+/// such as:
+///
+/// ```ignore
+/// // ❌ Does NOT compile with #[contracttype]
+/// pub enum CheckKind {
+///     Jurisdiction { contract: Address, allowed_codes: Vec<String> },
+/// }
+/// ```
+///
+/// are rejected by the macro with a compile error. This is a known limitation
+/// of the XDR-based storage encoding used by Soroban: each variant is stored
+/// as a tagged union, and named fields would require an extra layer of
+/// encoding that the macro does not generate.
+///
+/// **The correct pattern** is to wrap multi-field parameters in a dedicated
+/// `#[contracttype]` struct and use a single-tuple variant:
+///
+/// ```ignore
+/// // ✅ Correct: wrap multi-field params in a struct
+/// #[contracttype]
+/// pub struct JurisdictionCheck {
+///     pub contract: Address,
+///     pub allowed_codes: Vec<String>,
+/// }
+///
+/// #[contracttype]
+/// pub enum CheckKind {
+///     Jurisdiction(JurisdictionCheck),  // single-tuple variant — compiles
+/// }
+/// ```
+///
+/// If you add a new `CheckKind` variant that needs multiple parameters, follow
+/// this same pattern: define a `#[contracttype]` struct for the parameters,
+/// then add a single-tuple variant wrapping that struct. **Do not** attempt to
+/// use named-field variants, even if a future contributor believes the SDK now
+/// supports them — verify against the pinned SDK version in `Cargo.toml`
+/// before changing this shape.
 #[contracttype]
 #[derive(Clone)]
 pub enum CheckKind {
@@ -157,7 +250,7 @@ pub enum CheckKind {
 
 /// How the engine combines the results of multiple checks.
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CombineOp {
     /// AND — every check must pass. Used when an address must satisfy all
     /// compliance requirements simultaneously.
@@ -213,11 +306,13 @@ pub enum Error {
     /// exceed `MAX_CHECKS`. Keeps per-evaluation resource cost bounded and
     /// prevents unbounded storage growth.
     MaxDepthExceeded = 5,
-    /// Returned by `add_check` and `remove_check` when the contract has been
-    /// paused via `compliance-pausable`. Mutations are blocked while paused.
-    ContractPaused = 6,
+    /// Returned by `swap_checks` when either index `i` or `j` is out of
+    /// range for the current check list.
+    IndexOutOfBounds = 6,
+    /// Returned by state-changing entry points while the contract is paused.
+    ContractPaused = 7,
     /// Returned by `get_check` when the requested index is out of range.
-    CheckIndexOutOfRange = 7,
+    CheckIndexOutOfRange = 8,
 }
 
 /// Maximum number of checks that can be registered in a single policy
@@ -225,6 +320,14 @@ pub enum Error {
 /// overhead well within Soroban's instruction limits while still supporting
 /// all realistic compliance stack sizes.
 pub const MAX_CHECKS: u32 = 16;
+
+/// Extend the contract's instance storage when its remaining TTL drops below
+/// this many ledgers (~7 days at ~5s/ledger).
+pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960;
+
+/// Target remaining TTL, in ledgers, after an extension (~90 days at
+/// ~5s/ledger).
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200;
 
 /// Emitted by `evaluate` regardless of the pass/fail outcome so that
 /// off-chain compliance tooling can build a full audit trail even when the
@@ -305,6 +408,7 @@ impl PolicyEngine {
                 .instance()
                 .set(&DataKey::CircuitBreaker, &breaker);
         }
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -315,6 +419,7 @@ impl PolicyEngine {
         env.storage()
             .instance()
             .set(&DataKey::CircuitBreaker, &breaker);
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -345,6 +450,7 @@ impl PolicyEngine {
         }
         checks.push_back(check);
         env.storage().instance().set(&DataKey::Checks, &checks);
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -360,6 +466,48 @@ impl PolicyEngine {
             .ok_or(Error::NotInitialized)?;
         checks.remove(index);
         env.storage().instance().set(&DataKey::Checks, &checks);
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Swap the checks at positions `i` and `j` in the policy list.
+    /// Admin-only.
+    ///
+    /// Issuers can use this to reorder checks without having to remove and
+    /// re-add them (which would also change their indices). A common use case
+    /// is placing the cheapest check first so it short-circuits early under
+    /// `CombineOp::All`, avoiding unnecessary cross-contract calls.
+    ///
+    /// Returns `Err(Error::IndexOutOfBounds)` if either index is out of range.
+    /// No-ops if `i == j`.
+    pub fn swap_checks(env: Env, admin: Address, i: u32, j: u32) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if i == j {
+            return Ok(());
+        }
+        let mut checks: Vec<CheckKind> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Checks)
+            .ok_or(Error::NotInitialized)?;
+        let len = checks.len();
+        if i >= len || j >= len {
+            return Err(Error::IndexOutOfBounds);
+        }
+        let check_i = checks.get(i).unwrap();
+        let check_j = checks.get(j).unwrap();
+        checks.set(i, check_j);
+        checks.set(j, check_i);
+        env.storage().instance().set(&DataKey::Checks, &checks);
+        Ok(())
+    }
+
+    /// Remove every configured check in one call. Admin-only.
+    pub fn clear_checks(env: Env, admin: Address) -> Result<(), Error> {
+        compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        Self::require_admin(&env, &admin)?;
+        let empty: Vec<CheckKind> = Vec::new(&env);
+        env.storage().instance().set(&DataKey::Checks, &empty);
         Ok(())
     }
 
@@ -534,6 +682,15 @@ impl PolicyEngine {
         }
     }
 
+    /// Refresh the TTL of the contract instance (and therefore of every
+    /// instance-storage entry). See the "Storage and TTL policy" section of
+    /// the module docs.
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    }
+
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
         let stored_admin: Address = env
@@ -556,4 +713,7 @@ mod test;
 
 #[cfg(test)]
 mod fuzz;
+
+#[cfg(test)]
+mod bench;
 

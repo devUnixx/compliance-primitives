@@ -1,5 +1,11 @@
 use super::*;
-use super::test_utils::*;
+use crate::test_utils::{
+    MockCircuitBreaker, MockCircuitBreakerClient, MockDenylist, MockDenylistClient,
+    MockJurisdiction, MockJurisdictionClient,
+};
+use circuit_breaker::{CircuitBreaker, CircuitBreakerClient as CbClient};
+use denylist_gate::{DenylistGate, DenylistGateClient};
+use jurisdiction_flag::{JurisdictionFlag, JurisdictionFlagClient};
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{vec, Env, String};
 
@@ -201,6 +207,138 @@ fn test_add_and_remove_check() {
     assert_eq!(client.get_checks().len(), 1);
 }
 
+#[test]
+fn test_clear_checks_resets_policy_to_empty() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+
+    assert_eq!(client.get_checks().len(), 2);
+    client.clear_checks(&admin);
+    assert_eq!(client.get_checks().len(), 0);
+}
+
+/// `swap_checks` exchanges the positions of two checks so that `evaluate`
+/// follows the new order, including short-circuit behaviour under `CombineOp::All`.
+#[test]
+fn test_swap_checks_reorders_and_short_circuits() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // `from` is on the denylist — under CombineOp::All this check will fail.
+    MockDenylistClient::new(&env, &deny_id).add_to_denylist(&from);
+
+    // Both addresses have valid jurisdiction codes so the jurisdiction check passes.
+    let code_us = String::from_str(&env, "US");
+    MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&from, &code_us);
+    MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&to, &code_us);
+
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    // Add jurisdiction check first (index 0), then denylist check (index 1).
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+
+    // Before swap: jurisdiction (passes) then denylist (fails) → false.
+    assert!(!client.evaluate(&from, &to));
+
+    // Swap positions 0 and 1: denylist is now index 0, jurisdiction is index 1.
+    client.swap_checks(&admin, &0, &1);
+    let checks = client.get_checks();
+    assert_eq!(checks.len(), 2);
+    // The first check must now be the denylist check.
+    match checks.get(0).unwrap() {
+        CheckKind::Denylist(_) => {}
+        _ => panic!("expected Denylist at index 0 after swap"),
+    }
+    match checks.get(1).unwrap() {
+        CheckKind::Jurisdiction(_) => {}
+        _ => panic!("expected Jurisdiction at index 1 after swap"),
+    }
+
+    // After swap the denylist short-circuits first — result is still false,
+    // but the cheaper check now fires before the jurisdiction check.
+    assert!(!client.evaluate(&from, &to));
+}
+
+/// `swap_checks` with equal indices is a no-op — the list is unchanged.
+#[test]
+fn test_swap_checks_same_index_is_noop() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    assert_eq!(client.get_checks().len(), 1);
+
+    // Swapping index 0 with itself must not panic and must leave the list intact.
+    client.swap_checks(&admin, &0, &0);
+    assert_eq!(client.get_checks().len(), 1);
+}
+
+/// `swap_checks` with an out-of-range index panics (the generated client
+/// surfaces the contract error as a panic in test environments).
+#[test]
+#[should_panic]
+fn test_swap_checks_out_of_bounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+
+    // Only one check at index 0; index 1 is out of range.
+    client.swap_checks(&admin, &0, &1);
+}
+
 /// `get_policy` returns a `PolicyNode` whose `op` and `checks` fields exactly
 /// match what was configured via `initialize` / `add_check`.
 #[test]
@@ -208,6 +346,9 @@ fn test_get_policy_matches_configuration() {
     let env = Env::default();
     env.mock_all_auths();
 
+    // Set up two external contracts to use as checks.
+    let deny_admin = Address::generate(&env);
+    let juri_issuer = Address::generate(&env);
     let deny_id = setup_denylist(&env);
     let juri_id = setup_jurisdiction(&env);
 
@@ -241,18 +382,83 @@ fn test_get_policy_matches_configuration() {
 
     // First check must be the denylist check with the correct contract address.
     match policy.checks.get(0).unwrap() {
-        CheckKind::Denylist(params) => assert_eq!(params.contract, deny_id),
+        CheckKind::Denylist(inner) => assert_eq!(inner.contract, deny_id),
         _ => panic!("expected Denylist check at index 0"),
     }
 
     // Second check must be the jurisdiction check with correct contract and codes.
     match policy.checks.get(1).unwrap() {
-        CheckKind::Jurisdiction(params) => {
-            assert_eq!(params.contract, juri_id);
-            assert_eq!(params.allowed_codes, allowed_codes);
+        CheckKind::Jurisdiction(inner) => {
+            assert_eq!(inner.contract, juri_id);
+            assert_eq!(inner.allowed_codes, allowed_codes);
         }
         _ => panic!("expected Jurisdiction check at index 1"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// TTL extension
+// ---------------------------------------------------------------------------
+
+fn instance_ttl(env: &Env, contract_id: &Address) -> u32 {
+    use soroban_sdk::testutils::storage::Instance as _;
+    env.as_contract(contract_id, || env.storage().instance().get_ttl())
+}
+
+/// A write refreshes the instance TTL, so the policy stays readable after the
+/// ledger advances past the TTL the entries were originally given.
+#[test]
+fn test_write_extends_instance_ttl_past_original_expiry() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, contract_id, client) = setup_engine_all(&env);
+    let deny_id = setup_denylist(&env);
+
+    // `initialize` is a write path and must extend the TTL.
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+
+    // Advance until the remaining TTL drops below the extension threshold.
+    env.ledger().with_mut(|li| {
+        li.sequence_number += INSTANCE_TTL_EXTEND_TO - INSTANCE_TTL_THRESHOLD + 1;
+    });
+    assert!(instance_ttl(&env, &contract_id) < INSTANCE_TTL_THRESHOLD);
+
+    // A write refreshes the TTL back to the target.
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+
+    // Advance past the ledger at which the original TTL would have expired.
+    env.ledger().with_mut(|li| {
+        li.sequence_number += INSTANCE_TTL_THRESHOLD + 1;
+    });
+
+    // State written before and after the refresh is still readable.
+    assert_eq!(client.get_checks().len(), 1);
+    assert!(client.get_op() == CombineOp::All);
+
+    // Remaining write paths also refresh the TTL. Remaining TTL is currently
+    // EXTEND_TO - THRESHOLD - 1; drop it just below the threshold.
+    env.ledger().with_mut(|li| {
+        li.sequence_number += INSTANCE_TTL_EXTEND_TO - 2 * INSTANCE_TTL_THRESHOLD;
+    });
+    assert!(instance_ttl(&env, &contract_id) < INSTANCE_TTL_THRESHOLD);
+    client.remove_check(&admin, &0);
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+
+    env.ledger().with_mut(|li| {
+        li.sequence_number += INSTANCE_TTL_EXTEND_TO - INSTANCE_TTL_THRESHOLD + 1;
+    });
+    let breaker = Address::generate(&env);
+    client.set_circuit_breaker(&admin, &breaker);
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+    assert_eq!(client.circuit_breaker(), Some(breaker));
 }
 
 // ---------------------------------------------------------------------------
