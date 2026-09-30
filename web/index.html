@@ -28,6 +28,7 @@
     <div class="nav-actions">
       <div class="nav-links" id="site-nav">
         <a href="#contracts">Contracts</a>
+        <a href="#comparison">Comparison</a>
         <a href="#contract-lookup">Lookup</a>
         <a href="#architecture">Architecture</a>
         <a href="architecture.html">Diagram</a>
@@ -138,6 +139,117 @@
       <div class="card" data-search-item><h3>pausable</h3><p>Exposes a controlled pause state for contracts that need operational safety controls.</p><span class="tag">emergency control</span><div class="fns"><code>pause(admin)</code><code>unpause(admin)</code><a class="interface-link" href="https://github.com/stellar-compliance-kit/compliance-primitives/blob/main/docs/interfaces/pausable.md">Interface spec &rarr;</a></div></div>
       <div class="card" data-search-item><h3>policy-engine</h3><p>Evaluates configurable policy rules before an application permits a transfer.</p><span class="tag">rules</span><div class="fns"><code>evaluate(subject, action) -&gt; bool</code><a class="interface-link" href="https://github.com/stellar-compliance-kit/compliance-primitives/blob/main/docs/interfaces/policy-engine.md">Interface spec &rarr;</a></div></div>
     </div>
+  </div>
+</section>
+
+<section id="comparison">
+  <div class="wrap">
+    <h2>Comparison table</h2>
+    <p>
+      A side-by-side view of the nine contracts' key properties to help you
+      pick the right primitives for your use case.
+    </p>
+    <div class="cmp-table-wrap" tabindex="0" role="region" aria-label="Comparison table of nine contracts">
+      <table class="cmp-table">
+        <thead>
+          <tr>
+            <th scope="col">Contract</th>
+            <th scope="col">Composable</th>
+            <th scope="col">Standalone token</th>
+            <th scope="col">Upgradeable</th>
+            <th scope="col">Pausable</th>
+            <th scope="col">Compliance-officer role</th>
+            <th scope="col">Audit-log hook</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row"><a href="#contracts">allowlist-token</a></th>
+            <td class="cmp-no"  aria-label="Not composable">—</td>
+            <td class="cmp-yes" aria-label="Yes, standalone token">✓</td>
+            <td class="cmp-no"  aria-label="No upgrade path">—</td>
+            <td class="cmp-yes" aria-label="Yes, pausable">✓</td>
+            <td class="cmp-yes" aria-label="Yes, admin role">✓</td>
+            <td class="cmp-no"  aria-label="No audit-log hook">—</td>
+          </tr>
+          <tr>
+            <th scope="row"><a href="#contracts">denylist-gate</a></th>
+            <td class="cmp-yes" aria-label="Yes, composable">✓</td>
+            <td class="cmp-no"  aria-label="Not a standalone token">—</td>
+            <td class="cmp-no"  aria-label="No upgrade path">—</td>
+            <td class="cmp-no"  aria-label="Not pausable">—</td>
+            <td class="cmp-yes" aria-label="Yes, admin role">✓</td>
+            <td class="cmp-no"  aria-label="No audit-log hook">—</td>
+          </tr>
+          <tr>
+            <th scope="row"><a href="#contracts">jurisdiction-flag</a></th>
+            <td class="cmp-yes" aria-label="Yes, composable">✓</td>
+            <td class="cmp-no"  aria-label="Not a standalone token">—</td>
+            <td class="cmp-yes" aria-label="Yes, upgradeable">✓</td>
+            <td class="cmp-no"  aria-label="Not pausable">—</td>
+            <td class="cmp-yes" aria-label="Yes, issuer role">✓</td>
+            <td class="cmp-no"  aria-label="No audit-log hook">—</td>
+          </tr>
+          <tr>
+            <th scope="row"><a href="#contracts">audit-log</a></th>
+            <td class="cmp-yes" aria-label="Yes, composable">✓</td>
+            <td class="cmp-no"  aria-label="Not a standalone token">—</td>
+            <td class="cmp-no"  aria-label="No upgrade path">—</td>
+            <td class="cmp-no"  aria-label="Not pausable">—</td>
+            <td class="cmp-yes" aria-label="Yes, admin role">✓</td>
+            <td class="cmp-yes" aria-label="Yes, is the audit-log">✓</td>
+          </tr>
+          <tr>
+            <th scope="row"><a href="#contracts">circuit-breaker</a></th>
+            <td class="cmp-yes" aria-label="Yes, composable">✓</td>
+            <td class="cmp-no"  aria-label="Not a standalone token">—</td>
+            <td class="cmp-no"  aria-label="No upgrade path">—</td>
+            <td class="cmp-yes" aria-label="Yes, trip/reset acts as pause">✓</td>
+            <td class="cmp-yes" aria-label="Yes, admin role">✓</td>
+            <td class="cmp-no"  aria-label="No audit-log hook">—</td>
+          </tr>
+          <tr>
+            <th scope="row"><a href="#contracts">compliance-aggregator</a></th>
+            <td class="cmp-yes" aria-label="Yes, composable">✓</td>
+            <td class="cmp-no"  aria-label="Not a standalone token">—</td>
+            <td class="cmp-no"  aria-label="No upgrade path">—</td>
+            <td class="cmp-no"  aria-label="Not pausable">—</td>
+            <td class="cmp-yes" aria-label="Yes, admin role">✓</td>
+            <td class="cmp-no"  aria-label="No audit-log hook">—</td>
+          </tr>
+          <tr>
+            <th scope="row"><a href="#contracts">multisig-admin</a></th>
+            <td class="cmp-yes" aria-label="Yes, composable as admin">✓</td>
+            <td class="cmp-no"  aria-label="Not a standalone token">—</td>
+            <td class="cmp-no"  aria-label="No upgrade path">—</td>
+            <td class="cmp-no"  aria-label="Not pausable">—</td>
+            <td class="cmp-yes" aria-label="Yes, M-of-N signers">✓</td>
+            <td class="cmp-no"  aria-label="No audit-log hook">—</td>
+          </tr>
+          <tr>
+            <th scope="row"><a href="#contracts">pausable</a></th>
+            <td class="cmp-yes" aria-label="Yes, composable library">✓</td>
+            <td class="cmp-no"  aria-label="Not a standalone token">—</td>
+            <td class="cmp-no"  aria-label="No upgrade path">—</td>
+            <td class="cmp-yes" aria-label="Yes, is the pause primitive">✓</td>
+            <td class="cmp-yes" aria-label="Yes, admin role">✓</td>
+            <td class="cmp-no"  aria-label="No audit-log hook">—</td>
+          </tr>
+          <tr>
+            <th scope="row"><a href="#contracts">policy-engine</a></th>
+            <td class="cmp-yes" aria-label="Yes, composable">✓</td>
+            <td class="cmp-no"  aria-label="Not a standalone token">—</td>
+            <td class="cmp-no"  aria-label="No upgrade path">—</td>
+            <td class="cmp-no"  aria-label="Not pausable">—</td>
+            <td class="cmp-yes" aria-label="Yes, admin role">✓</td>
+            <td class="cmp-yes" aria-label="Yes, emits compliance events">✓</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cmp-legend">
+      ✓ = supported &nbsp;|&nbsp; — = not applicable / not present
+    </p>
   </div>
 </section>
 
