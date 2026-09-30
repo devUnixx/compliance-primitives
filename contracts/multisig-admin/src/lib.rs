@@ -498,11 +498,10 @@ impl MultisigAdmin {
             .get(&DataKey::NextProposalId)
             .unwrap_or(0);
 
-        let signers: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Signers)
-            .ok_or(Error::NotInitialized)?;
+        // Guard: contract must be initialized before proposals can be created.
+        if !env.storage().instance().has(&DataKey::Signers) {
+            return Err(Error::NotInitialized);
+        }
 
         let proposal = Proposal {
             payload,
@@ -526,6 +525,9 @@ impl MultisigAdmin {
     /// to execute.
     pub fn approve(env: Env, proposal_id: u64, approver: Address) -> Result<bool, Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        // The approver must prove they authorized this call — prevents any
+        // caller from submitting someone else's approval on their behalf.
+        approver.require_auth();
         let current_ledger = env.ledger().sequence();
 
         let mut proposal: Proposal = env
@@ -607,6 +609,11 @@ impl MultisigAdmin {
             .instance()
             .remove(&DataKey::Proposal(proposal_id));
         extend_instance_ttl(&env);
+
+        // Emit an on-chain event so off-chain indexers can track which
+        // proposals have been executed and when.
+        env.events()
+            .publish((soroban_sdk::symbol_short!("PropExec"),), proposal_id);
 
         Ok(())
     }
