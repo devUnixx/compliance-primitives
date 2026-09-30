@@ -441,3 +441,45 @@ capped at **25** (or lower, to leave headroom for the surrounding transaction),
 consistent with the miscalibration found for denylist-gate's `MAX_BATCH_SIZE`.
 This cap is intentionally **not** added here — the issue defers it to the future
 shared-cap work.
+
+## CombineOp Short-Circuit Savings
+
+`evaluate` short-circuits early depending on the configured `CombineOp`:
+
+- **`CombineOp::All`**: stops on the **first failing** check — best case is 1
+  cross-contract call per address; worst case is N calls per address (all pass).
+- **`CombineOp::Any`**: stops on the **first passing** check — best case is 1
+  call per address; worst case is N calls per address (all fail).
+
+The benchmarks live in
+`contracts/policy-engine/src/bench.rs` and can be run as part of the normal
+test suite:
+
+```sh
+cargo test -p policy-engine bench -- --nocapture
+```
+
+### Scenarios (3-check policy)
+
+| Scenario | Checks evaluated per address | Expected result |
+|---|---|---|
+| `All` / best case — first check fails | 1 | `false` |
+| `All` / worst case — all checks pass | 3 | `true` |
+| `Any` / best case — first check passes | 1 | `true` |
+| `Any` / worst case — all checks fail | 3 | `false` |
+| Single-check baseline | 1 | `true` |
+
+**Key finding**: in the worst case (`All` with all checks passing, or `Any`
+with all checks failing), every cross-contract call is made — resource cost
+scales linearly with the number of registered checks.  In the best case the
+engine exits after a single check, saving `(N−1) × (cross-contract call cost)`
+instructions.  For a 3-check policy with ~120 instructions per call, the
+short-circuit saves roughly **240 instructions** (2 skipped calls × 2 addresses
+skipped in some paths).
+
+**Implication for issuers**: register the check that is most likely to
+short-circuit *first*.  Under `CombineOp::All`, put the cheapest or
+most-commonly-failing check at index 0.  Under `CombineOp::Any`, put the
+cheapest or most-commonly-passing check at index 0.  The new `swap_checks`
+entry point (see issue #407) makes it easy to reorder checks without
+removing and re-adding them.
