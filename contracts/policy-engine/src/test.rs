@@ -658,3 +658,36 @@ fn test_all_three_check_kinds_all_fail_any() {
     let result = client.evaluate(&from, &to);
     assert!(!result, "expected false when all three checks fail under Any");
 }
+
+// ---------------------------------------------------------------------------
+// Tests for issue #404: get_admin view function
+// ---------------------------------------------------------------------------
+
+/// `get_admin` returns the address that was passed to `initialize`.
+#[test]
+fn test_get_admin_returns_initialized_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    let returned_admin = client.get_admin();
+    assert_eq!(returned_admin, admin, "get_admin should return the initialized admin address");
+}
+
+/// `get_admin` returns `Err(NotInitialized)` when called before `initialize`.
+#[test]
+fn test_get_admin_not_initialized_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Register the contract but do NOT call initialize.
+    let id = env.register(PolicyEngine, ());
+    let client = PolicyEngineClient::new(&env, &id);
+
+    let result = client.try_get_admin();
+    assert!(
+        result.is_err(),
+        "get_admin should return an error before initialization"
+    );
+}

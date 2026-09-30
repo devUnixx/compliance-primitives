@@ -614,6 +614,19 @@ impl PolicyEngine {
     // Read-only accessors
     // -----------------------------------------------------------------------
 
+    /// Returns the current admin address, or `Err(Error::NotInitialized)` if
+    /// the contract has not yet been initialized.
+    ///
+    /// Useful for off-chain tooling, UIs, and other contracts that need to
+    /// verify who controls this policy-engine instance without having to
+    /// replay the initialization transaction.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
     /// Returns the current list of registered checks.
     pub fn get_checks(env: Env) -> Vec<CheckKind> {
         env.storage()
