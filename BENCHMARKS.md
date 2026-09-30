@@ -483,3 +483,41 @@ most-commonly-failing check at index 0.  Under `CombineOp::Any`, put the
 cheapest or most-commonly-passing check at index 0.  The new `swap_checks`
 entry point (see issue #407) makes it easy to reorder checks without
 removing and re-adding them.
+
+## Compliance-Aggregator `check_address` Budget Regression
+
+`compliance-aggregator` is covered by the same budget-regression harness as
+the original primitives. Its hottest entrypoint is `check_address`: consumers
+call it once per transfer, and it fans out to every registered primitive.
+
+**Scenario** (`test_budget_regression_check_address` in
+`contracts/compliance-aggregator/src/test.rs`):
+
+- Aggregator initialized with both `denylist-gate` and `jurisdiction-flag`
+  registered (no circuit-breaker).
+- The checked address has a permitted jurisdiction (`US`) and is not on the
+  denylist, so both downstream checks run and pass.
+- The budget is reset immediately before `check_address` and read
+  immediately after, so only the call itself is measured.
+
+**Resource profile**:
+
+- 1 cross-contract call from the consumer to the aggregator
+- 2 downstream cross-contract calls (`denylist-gate.check`,
+  `jurisdiction-flag.is_permitted_jurisdiction`)
+- 2 instance-storage reads in the aggregator (gate + flag addresses) plus 1
+  for the optional circuit-breaker lookup
+- 1 persistent-storage lookup in each primitive
+
+**Baseline**: `[compliance-aggregator.check_address]` in
+`budget-baselines.toml`. The test fails — and therefore the
+`budget-regression` CI job (`cargo test --workspace budget_regression`)
+fails — if measured CPU instructions or memory bytes exceed the baseline by
+more than **10%**.
+
+To re-record the baseline after an intentional change:
+
+```bash
+cargo test -p compliance-aggregator budget_regression -- --nocapture
+# copy the printed `cpu = … , memory = …` values into budget-baselines.toml
+```

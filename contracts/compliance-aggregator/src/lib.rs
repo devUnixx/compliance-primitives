@@ -50,10 +50,40 @@
 //! Both checks are optional; if a check type's contract address has not been
 //! registered the check is skipped (treated as passing). Registering at least
 //! one check is enforced at call time.
+//!
+//! ## Upgradeability
+//!
+//! `upgrade(admin, new_wasm_hash)` lets the configured admin move the
+//! contract's code to a new WASM hash via
+//! `env.deployer().update_current_contract_wasm`, following the same
+//! admin-gated pattern used by `jurisdiction-flag` and `policy-engine`.
+//! Only the stored admin may call it; any other caller is rejected with
+//! `Error::NotAuthorized`, and calling it before `initialize` returns
+//! `Error::NotInitialized`. An `UpgradePerformed` event is emitted so the
+//! upgrade is visible to indexers.
+//!
+//! The WASM swap does not touch storage: the admin, the registered
+//! `denylist-gate` / `jurisdiction-flag` / `circuit-breaker` addresses, and
+//! the pause flag all live in instance storage under the same `DataKey`
+//! variants and are read unchanged by the new code, so the contract is
+//! callable immediately after the upgrade. Upgrade procedure:
+//!
+//! 1. Build the new release WASM
+//!    (`stellar contract build` / `make build`).
+//! 2. Upload it: `stellar contract upload --wasm compliance_aggregator.wasm`
+//!    — this prints the new WASM hash.
+//! 3. Invoke `upgrade --admin <ADMIN> --new_wasm_hash <HASH>` on the
+//!    deployed aggregator, signed by the admin (or the `multisig-admin`
+//!    quorum if the admin is a multisig).
+//!
+//! A new version **must not** reorder or remove existing `DataKey` variants
+//! or change the types stored under them; add new variants instead. See
+//! `STORAGE_VERSIONING.md` for the repo-wide rules.
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    String, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -202,6 +232,15 @@ pub struct CircuitBreakerSet {
     pub breaker: Address,
 }
 
+/// Emitted whenever the contract is upgraded to a new WASM implementation,
+/// for on-chain auditability of the upgrade path.
+#[contractevent]
+pub struct UpgradePerformed {
+    #[topic]
+    pub admin: Address,
+    pub new_wasm_hash: BytesN<32>,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -348,6 +387,24 @@ impl ComplianceAggregator {
             .set(&DataKey::CircuitBreaker, &breaker);
         extend_instance_ttl(&env);
         CircuitBreakerSet { breaker }.publish(&env);
+        Ok(())
+    }
+
+    /// Upgrade the contract WASM. Admin-only.
+    ///
+    /// Swaps the code behind this contract ID to `new_wasm_hash` (which must
+    /// already be uploaded to the network). All instance storage — admin,
+    /// registered check addresses, circuit-breaker, pause flag — is
+    /// preserved across the upgrade. See the module-level "Upgradeability"
+    /// section for the full procedure.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        UpgradePerformed {
+            admin,
+            new_wasm_hash: new_wasm_hash.clone(),
+        }
+        .publish(&env);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
 

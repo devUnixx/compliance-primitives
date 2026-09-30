@@ -334,6 +334,78 @@ fn test_check_auth_distinct_signers_not_flagged_as_duplicate() {
 }
 
 // ---------------------------------------------------------------------------
+// TTL extension
+// ---------------------------------------------------------------------------
+
+fn instance_ttl(env: &Env, contract_id: &Address) -> u32 {
+    use soroban_sdk::testutils::storage::Instance as _;
+    env.as_contract(contract_id, || env.storage().instance().get_ttl())
+}
+
+/// Advance the ledger far enough that the instance TTL drops below the
+/// extension threshold.
+fn advance_past_threshold(env: &Env) {
+    use soroban_sdk::testutils::Ledger as _;
+    env.ledger().with_mut(|li| {
+        li.sequence_number += INSTANCE_TTL_EXTEND_TO - INSTANCE_TTL_THRESHOLD + 1;
+    });
+}
+
+#[test]
+fn test_initialize_extends_instance_ttl() {
+    let env = Env::default();
+    let (_signers, contract_id, _client) = setup_multisig(&env, 3, 2);
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+}
+
+#[test]
+fn test_write_refreshes_ttl_and_state_survives_past_original_ttl() {
+    let env = Env::default();
+    let (signers, contract_id, client) = setup_multisig(&env, 3, 2);
+    let new_signer = Address::generate(&env);
+
+    advance_past_threshold(&env);
+    assert!(instance_ttl(&env, &contract_id) < INSTANCE_TTL_THRESHOLD);
+
+    // A write refreshes the TTL back to the configured target.
+    client.add_signer(&new_signer);
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+
+    // Advance again: the ledger is now well past the TTL granted at
+    // initialization, but the refreshed entry is still live and readable.
+    advance_past_threshold(&env);
+    let (stored, threshold) = client.get_signers();
+    assert_eq!(stored.len(), signers.len() + 1);
+    assert_eq!(stored.get(3).unwrap(), new_signer);
+    assert_eq!(threshold, 2);
+}
+
+#[test]
+fn test_proposal_writes_refresh_ttl() {
+    let env = Env::default();
+    let (signers, contract_id, client) = setup_multisig(&env, 3, 2);
+    let payload = Bytes::from_array(&env, &[1u8, 2, 3]);
+    let far_expiry = INSTANCE_TTL_EXTEND_TO * 4;
+
+    advance_past_threshold(&env);
+    let proposal_id = client.propose(&payload, &far_expiry);
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+
+    advance_past_threshold(&env);
+    client.approve(&proposal_id, &signers.get(0).unwrap());
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+
+    advance_past_threshold(&env);
+    client.approve(&proposal_id, &signers.get(1).unwrap());
+    let (_payload, _expiry, approvals) = client.get_proposal(&proposal_id);
+    assert_eq!(approvals.len(), 2);
+
+    advance_past_threshold(&env);
+    client.execute(&proposal_id);
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+}
+
+// ---------------------------------------------------------------------------
 // Upgrade / migration path
 // ---------------------------------------------------------------------------
 

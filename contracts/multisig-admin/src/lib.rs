@@ -44,6 +44,72 @@
 //! which re-enters `__check_auth`, ensuring no single signer can unilaterally
 //! change the policy.
 //!
+//! ## Who calls this contract
+//!
+//! There are three distinct kinds of caller, and each touches a different
+//! part of the surface:
+//!
+//! - **The deployer / issuer operations team** calls [`MultisigAdmin::initialize`]
+//!   exactly once with the initial signer set and threshold. After that the
+//!   deployer has no special privileges — every later change goes through
+//!   the multisig itself.
+//! - **The Soroban host** calls `__check_auth` on behalf of any contract
+//!   that runs `admin.require_auth()` where `admin` is this contract's
+//!   address. Signers never call `__check_auth` directly; they sign the
+//!   authorization entry for the outer operation (e.g. `denylist-gate.add_to_denylist`)
+//!   and the submitter attaches the list of approving signer addresses as the
+//!   `signatures` value.
+//! - **Individual signers** call `propose`, `approve`, and `execute` to
+//!   coordinate an off-chain-visible approval trail before submitting the
+//!   final transaction, and collectively (via `__check_auth`) call
+//!   `add_signer`, `remove_signer`, `update_threshold`, `pause`, and
+//!   `unpause` to govern this contract's own configuration.
+//!
+//! Read-only accessors (`get_signers`, `get_threshold`, `get_proposal`,
+//! `is_paused`) may be called by anyone, including off-chain tooling such as
+//! `tools/indexer` and other contracts deciding whether to trust this
+//! contract as an admin.
+//!
+//! ## Composition with the other contracts in this repo
+//!
+//! This contract never calls the other contracts itself — composition is
+//! entirely by *address*: you pass this contract's ID wherever another
+//! contract asks for an admin/issuer `Address`, and Soroban's auth framework
+//! routes the `require_auth()` back here.
+//!
+//! | Contract | Role this contract plays | Operations it gates |
+//! |---|---|---|
+//! | `allowlist-token` | `admin` | allowlist add/remove, timelocked upgrade |
+//! | `denylist-gate` | `admin` | denylist add/remove, timelocked upgrade |
+//! | `jurisdiction-flag` | `issuer` | setting/clearing jurisdiction flags, upgrade |
+//! | `policy-engine` | `admin` | registering/removing checks, combine op |
+//! | `compliance-aggregator` | `admin` | wiring gate/flag/breaker addresses, pause |
+//! | `circuit-breaker` | `admin` | `freeze` / `unfreeze` (emergency stop) |
+//! | `audit-log` | `admin` | audit-log administration |
+//! | `pausable` (shared crate) | — | used *internally* here to back `pause`/`unpause` |
+//!
+//! Typical deployment: deploy `multisig-admin` first, initialize it with the
+//! operations team's signer keys, then initialize each primitive with the
+//! multisig's contract ID as its admin. One multisig can govern every
+//! primitive in a deployment, giving a single auditable M-of-N policy. A
+//! common pattern is to pair it with `audit-log` (record proposal creation,
+//! approvals, and execution — see the `multisig-audit-trail` example) and to
+//! make it the admin of `circuit-breaker` so that an emergency freeze still
+//! requires quorum.
+//!
+//! ## Storage and TTL policy
+//!
+//! All state (signer set, threshold, pending proposals, next proposal ID,
+//! pause flag) lives in **instance storage**, which shares a single TTL with
+//! the contract instance entry. Every write path calls
+//! `extend_instance_ttl`, which extends that TTL to
+//! [`INSTANCE_TTL_EXTEND_TO`] ledgers (~30 days at ~5s/ledger) whenever the
+//! remaining TTL has fallen below [`INSTANCE_TTL_THRESHOLD`] ledgers
+//! (~1 day). A multisig that is written to at least once a month therefore
+//! never becomes archived; one that sits idle longer must be restored (e.g.
+//! `stellar contract restore`) before its admin powers can be exercised,
+//! otherwise every governed primitive's `require_auth()` would fail.
+//!
 //! ## Upgradeability
 //!
 //! `upgrade(new_wasm_hash)` moves the contract's code to a new WASM hash via
@@ -128,6 +194,22 @@ mod events {
 // Storage
 // ---------------------------------------------------------------------------
 
+/// Extend the instance TTL when it drops below this many ledgers
+/// (~1 day at ~5s/ledger).
+pub const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
+
+/// Target remaining instance TTL after extension (~30 days at ~5s/ledger).
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 518_400;
+
+/// Refresh the TTL of the contract instance (and therefore of every
+/// instance-storage entry: signers, threshold, proposals, pause flag).
+/// Called on every write path so live state survives Soroban archival.
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+}
+
 #[contracttype]
 #[derive(Clone)]
 struct Proposal {
@@ -208,6 +290,7 @@ impl MultisigAdmin {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -215,6 +298,7 @@ impl MultisigAdmin {
     pub fn pause(env: Env) -> Result<(), Error> {
         env.current_contract_address().require_auth();
         compliance_pausable::pause(&env);
+        extend_instance_ttl(&env);
         env.events().publish((), soroban_sdk::symbol_short!("Paused"));
         Ok(())
     }
@@ -223,6 +307,7 @@ impl MultisigAdmin {
     pub fn unpause(env: Env) -> Result<(), Error> {
         env.current_contract_address().require_auth();
         compliance_pausable::unpause(&env);
+        extend_instance_ttl(&env);
         env.events().publish((), soroban_sdk::symbol_short!("Unpaused"));
         Ok(())
     }
@@ -275,6 +360,7 @@ impl MultisigAdmin {
 
         signers.push_back(new_signer.clone());
         env.storage().instance().set(&DataKey::Signers, &signers);
+        extend_instance_ttl(&env);
         events::signer_added(&env, &new_signer);
         Ok(())
     }
@@ -314,6 +400,7 @@ impl MultisigAdmin {
         }
 
         env.storage().instance().set(&DataKey::Signers, &signers);
+        extend_instance_ttl(&env);
         events::signer_removed(&env, &signer);
         Ok(())
     }
@@ -336,6 +423,7 @@ impl MultisigAdmin {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
+        extend_instance_ttl(&env);
         events::threshold_updated(&env, threshold);
         Ok(())
     }
@@ -410,6 +498,7 @@ impl MultisigAdmin {
         env.storage()
             .instance()
             .set(&DataKey::NextProposalId, &(proposal_id + 1));
+        extend_instance_ttl(&env);
 
         Ok(proposal_id)
     }
@@ -460,6 +549,7 @@ impl MultisigAdmin {
         env.storage()
             .instance()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+        extend_instance_ttl(&env);
 
         let threshold: u32 = env
             .storage()
@@ -498,6 +588,7 @@ impl MultisigAdmin {
         env.storage()
             .instance()
             .remove(&DataKey::Proposal(proposal_id));
+        extend_instance_ttl(&env);
 
         Ok(())
     }

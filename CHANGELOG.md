@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **compliance-aggregator**: Admin-gated `upgrade(admin, new_wasm_hash)`
+  entrypoint with an `UpgradePerformed` event, a migration test that
+  deploys, writes state, upgrades, and verifies state is intact and callable,
+  and module-level upgrade documentation (#195)
+- **compliance-aggregator**: `check_address` budget-regression benchmark
+  with a `[compliance-aggregator.check_address]` entry in
+  `budget-baselines.toml` (#196)
+- **multisig-admin**: Expanded module-level docs covering purpose, callers,
+  and composition with the other contracts in the repo (#197)
+- **multisig-admin**: Instance TTL is extended on every write path
+  (`INSTANCE_TTL_THRESHOLD` / `INSTANCE_TTL_EXTEND_TO`), with tests that
+  advance the ledger past the original TTL (#198)
 - **multisig-admin**: `upgrade(new_wasm_hash)` entrypoint, gated by the M-of-N
   threshold, with a migration test confirming state survives the upgrade
 - **multisig-admin**: `__check_auth` resource-fee benchmark and
