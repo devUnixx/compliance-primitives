@@ -4,7 +4,7 @@ use super::*;
 use denylist_gate::{DenylistGate, DenylistGateClient};
 use soroban_sdk::{
     testutils::Address as _,
-    vec, Address, Bytes, Env,
+    vec, Address, Bytes, BytesN, Env,
 };
 
 /// Build an arbitrary 32-byte payload hash for `__check_auth` calls in tests.
@@ -331,4 +331,257 @@ fn test_check_auth_distinct_signers_not_flagged_as_duplicate() {
     let sigs = vec![&env, signers.get(0).unwrap(), signers.get(1).unwrap()];
     let result = MultisigAdmin::__check_auth(env.clone(), payload, sigs, Vec::new(&env));
     assert_eq!(result, Ok(()));
+}
+
+// ---------------------------------------------------------------------------
+// TTL extension
+// ---------------------------------------------------------------------------
+
+fn instance_ttl(env: &Env, contract_id: &Address) -> u32 {
+    use soroban_sdk::testutils::storage::Instance as _;
+    env.as_contract(contract_id, || env.storage().instance().get_ttl())
+}
+
+/// Advance the ledger far enough that the instance TTL drops below the
+/// extension threshold.
+fn advance_past_threshold(env: &Env) {
+    use soroban_sdk::testutils::Ledger as _;
+    env.ledger().with_mut(|li| {
+        li.sequence_number += INSTANCE_TTL_EXTEND_TO - INSTANCE_TTL_THRESHOLD + 1;
+    });
+}
+
+#[test]
+fn test_initialize_extends_instance_ttl() {
+    let env = Env::default();
+    let (_signers, contract_id, _client) = setup_multisig(&env, 3, 2);
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+}
+
+#[test]
+fn test_write_refreshes_ttl_and_state_survives_past_original_ttl() {
+    let env = Env::default();
+    let (signers, contract_id, client) = setup_multisig(&env, 3, 2);
+    let new_signer = Address::generate(&env);
+
+    advance_past_threshold(&env);
+    assert!(instance_ttl(&env, &contract_id) < INSTANCE_TTL_THRESHOLD);
+
+    // A write refreshes the TTL back to the configured target.
+    client.add_signer(&new_signer);
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+
+    // Advance again: the ledger is now well past the TTL granted at
+    // initialization, but the refreshed entry is still live and readable.
+    advance_past_threshold(&env);
+    let (stored, threshold) = client.get_signers();
+    assert_eq!(stored.len(), signers.len() + 1);
+    assert_eq!(stored.get(3).unwrap(), new_signer);
+    assert_eq!(threshold, 2);
+}
+
+#[test]
+fn test_proposal_writes_refresh_ttl() {
+    let env = Env::default();
+    let (signers, contract_id, client) = setup_multisig(&env, 3, 2);
+    let payload = Bytes::from_array(&env, &[1u8, 2, 3]);
+    let far_expiry = INSTANCE_TTL_EXTEND_TO * 4;
+
+    advance_past_threshold(&env);
+    let proposal_id = client.propose(&payload, &far_expiry);
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+
+    advance_past_threshold(&env);
+    client.approve(&proposal_id, &signers.get(0).unwrap());
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+
+    advance_past_threshold(&env);
+    client.approve(&proposal_id, &signers.get(1).unwrap());
+    let (_payload, _expiry, approvals) = client.get_proposal(&proposal_id);
+    assert_eq!(approvals.len(), 2);
+
+    advance_past_threshold(&env);
+    client.execute(&proposal_id);
+    assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade / migration path
+// ---------------------------------------------------------------------------
+
+/// Path to the release WASM produced by
+/// `cargo build --workspace --target wasm32v1-none --release`.
+fn multisig_admin_wasm_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("wasm32v1-none")
+        .join("release")
+        .join("multisig_admin.wasm")
+}
+
+#[test]
+fn test_upgrade_before_initialize_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MultisigAdmin, ());
+    let client = MultisigAdminClient::new(&env, &contract_id);
+    let hash = BytesN::from_array(&env, &[0u8; 32]);
+    let result = client.try_upgrade(&hash);
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+}
+
+/// Without the multisig's own authorization (i.e. without the threshold
+/// being met through `__check_auth`), `upgrade` must be rejected.
+#[test]
+fn test_upgrade_requires_multisig_auth() {
+    let env = Env::default();
+    let contract_id = env.register(MultisigAdmin, ());
+    let client = MultisigAdminClient::new(&env, &contract_id);
+    let signers = vec![&env, Address::generate(&env), Address::generate(&env)];
+    client.initialize(&signers, &2);
+
+    let hash = BytesN::from_array(&env, &[0u8; 32]);
+    assert!(client.try_upgrade(&hash).is_err());
+}
+
+/// Deploy from WASM, write state, upgrade to a freshly uploaded WASM hash,
+/// then confirm every piece of state survived and the contract is still
+/// callable. Requires the release WASM (`make build`); skipped otherwise.
+#[test]
+fn test_upgrade_preserves_state_and_remains_callable() {
+    let wasm_path = multisig_admin_wasm_path();
+    let wasm = match std::fs::read(&wasm_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            std::eprintln!(
+                "skipping migration test: {} not found (run `make build` first)",
+                wasm_path.display()
+            );
+            return;
+        }
+    };
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Deploy the current release WASM and write state.
+    let contract_id = env.register(wasm.as_slice(), ());
+    let client = MultisigAdminClient::new(&env, &contract_id);
+    let signers = vec![&env, Address::generate(&env), Address::generate(&env)];
+    client.initialize(&signers, &2);
+    let extra_signer = Address::generate(&env);
+    client.add_signer(&extra_signer);
+    let payload = Bytes::from_array(&env, &[1, 2, 3]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry);
+    client.approve(&proposal_id, &signers.get(0).unwrap());
+
+    // Upgrade to a newly uploaded WASM hash.
+    let new_hash = env
+        .deployer()
+        .upload_contract_wasm(Bytes::from_slice(&env, &wasm));
+    client.upgrade(&new_hash);
+
+    // State is intact.
+    let (stored_signers, threshold) = client.get_signers();
+    assert_eq!(stored_signers.len(), 3);
+    assert_eq!(stored_signers.get(2).unwrap(), extra_signer);
+    assert_eq!(threshold, 2);
+    let (stored_payload, stored_expiry, approvals) = client.get_proposal(&proposal_id);
+    assert_eq!(stored_payload, payload);
+    assert_eq!(stored_expiry, expiry);
+    assert_eq!(approvals.len(), 1);
+
+    // And the contract is still callable after the upgrade.
+    assert!(client.approve(&proposal_id, &signers.get(1).unwrap()));
+    client.execute(&proposal_id);
+    client.update_threshold(&3);
+    assert_eq!(client.get_threshold(), 3);
+    assert_eq!(client.propose(&payload, &expiry), proposal_id + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Resource-fee benchmark (budget regression) — `__check_auth`
+// ---------------------------------------------------------------------------
+
+fn read_baseline(path: &std::path::Path, section: &str) -> (u64, u64) {
+    let contents = std::fs::read_to_string(path).unwrap();
+    let section_header = std::format!("[{section}]");
+    let mut in_section = false;
+    let mut cpu = None;
+    let mut memory = None;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_section = trimmed == section_header;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("cpu = ") {
+            cpu = Some(value.parse::<u64>().unwrap());
+        } else if let Some(value) = trimmed.strip_prefix("memory = ") {
+            memory = Some(value.parse::<u64>().unwrap());
+        }
+    }
+
+    let cpu = cpu.expect("missing cpu baseline");
+    let memory = memory.expect("missing memory baseline");
+    (cpu, memory)
+}
+
+fn baseline_path_for_manifest_dir(manifest_dir: std::path::PathBuf) -> std::path::PathBuf {
+    manifest_dir.join("..").join("..").join("budget-baselines.toml")
+}
+
+fn assert_budget_within_threshold(measured: (u64, u64), baseline: (u64, u64), label: &str) {
+    let (measured_cpu, measured_memory) = measured;
+    let (baseline_cpu, baseline_memory) = baseline;
+    let cpu_limit = (baseline_cpu as f64 * 1.10).ceil() as u64;
+    let memory_limit = (baseline_memory as f64 * 1.10).ceil() as u64;
+
+    assert!(
+        measured_cpu <= cpu_limit,
+        "{label} CPU regression: measured {measured_cpu}, baseline {baseline_cpu}, limit {cpu_limit}"
+    );
+    assert!(
+        measured_memory <= memory_limit,
+        "{label} memory regression: measured {measured_memory}, baseline {baseline_memory}, limit {memory_limit}"
+    );
+}
+
+/// `__check_auth` is the hottest entrypoint: it runs on every admin
+/// operation of every primitive that uses this contract as its admin.
+/// Measured with a 2-of-3 signer set and a 2-signature approval.
+#[test]
+fn test_budget_regression_multisig_check_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, contract_id, _client) = setup_multisig(&env, 3, 2);
+
+    let payload = dummy_payload(&env);
+    let sigs = vec![&env, signers.get(0).unwrap(), signers.get(1).unwrap()];
+
+    let mut budget = env.cost_estimate().budget();
+    budget.reset_default();
+    let result = env.as_contract(&contract_id, || {
+        MultisigAdmin::__check_auth(env.clone(), payload, sigs, Vec::new(&env))
+    });
+    assert_eq!(result, Ok(()));
+
+    let measured = (budget.cpu_instruction_cost(), budget.memory_bytes_cost());
+    std::println!(
+        "multisig-admin __check_auth: cpu={} memory={}",
+        measured.0,
+        measured.1
+    );
+    let baseline_path = baseline_path_for_manifest_dir(std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").unwrap(),
+    ));
+    let baseline = read_baseline(&baseline_path, "multisig-admin.__check_auth");
+    assert_budget_within_threshold(measured, baseline, "multisig-admin __check_auth");
 }
