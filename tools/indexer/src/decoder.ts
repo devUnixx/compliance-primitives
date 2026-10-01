@@ -8,7 +8,7 @@
  *   topic[1+] = the fields annotated #[topic] in declaration order
  *   data      = ScVal — struct-value encoding of any non-topic fields
  *
- * For the five event types from allowlist/denylist/jurisdiction contracts:
+ * For primitive and circuit-breaker events:
  *
  *   AllowAdd        topics: [Symbol("AllowAdd"), Address]          data: Void
  *   AllowRemove     topics: [Symbol("AllowRemove"), Address]        data: Void
@@ -16,8 +16,19 @@
  *   DenyAdd         topics: [Symbol("DenyAdd"), Address]            data: Void
  *   DenyRemove      topics: [Symbol("DenyRemove"), Address]         data: Void
  *   JurisdictionSet topics: [Symbol("JurisdictionSet"), Address]    data: String(code)
- *   Frozen          topics: [Symbol("Frozen"), Address]             data: Void
- *   Unfrozen        topics: [Symbol("Unfrozen"), Address]           data: Void
+ *   Frozen          topics: [Symbol("Frozen"), Address(admin)]       data: Void
+ *   Unfrozen        topics: [Symbol("Unfrozen"), Address(admin)]     data: Void
+ *
+ * For policy-engine:
+ *
+ *   PolicyResult topics: [Symbol("PolicyResult"), Bool(passed)]
+ *               data:   Vec[Address(from), Address(to)]
+ *
+ * For multisig-admin:
+ *
+ *   SignerAdd / SignerRm topics: [Symbol(name), Address(signer)] data: Void
+ *   ThreshSet            topics: [Symbol("ThreshSet")]          data: U32(threshold)
+ *   AuthOk               topics: [Symbol("AuthOk")]             data: Vec[U32(valid_count), U32(threshold)]
  *
  * For the audit-log contract's ComplianceEvent:
  *
@@ -328,6 +339,28 @@ export function decodeEvent(
       ? Math.floor(new Date(raw.ledgerClosedAt).getTime() / 1000)
       : null;
 
+    const base: RawEvent = {
+      ledgerSequence: raw.ledger,
+      timestamp,
+      contractId: raw.contractId,
+      eventType: "",
+      address: null,
+      addressTo: null,
+      amount: null,
+      jurisdiction: null,
+      kind: null,
+      source: null,
+      detail: null,
+      signerAddress: null,
+      newThreshold: null,
+      validCount: null,
+      policyFrom: null,
+      policyTo: null,
+      policyPassed: null,
+      rawTopics: JSON.stringify(raw.topic),
+      rawData: raw.value ?? "",
+    };
+
     // ── audit-log ComplianceEvent detection ──────────────────────────────────
     //
     // ComplianceEvent has NO struct-name prefix topic.  The topic array is
@@ -378,6 +411,20 @@ export function decodeEvent(
     const nameVal = topics[0];
     if (nameVal.type !== "Symbol") return null;
     const eventType = nameVal.value;
+
+    // ── circuit-breaker state-change events ───────────────────────────────────
+    //
+    // Frozen / Unfrozen:
+    //   topics: [Symbol("Frozen"|"Unfrozen"), Address(admin)]
+    //   data:   Void
+    //
+    // topic[1] carries the admin address that triggered the change, but we
+    // intentionally store address as null — the contract_id column identifies
+    // which breaker instance changed state, which is the useful lookup key.
+    if (eventType === "Frozen" || eventType === "Unfrozen") {
+      return { ...base, eventType, address: null };
+    }
+
     if (!KNOWN_EVENTS.has(eventType)) return null;
 
     // ── policy-engine PolicyResult ────────────────────────────────────────────
@@ -445,9 +492,7 @@ export function decodeEvent(
     }
 
     return {
-      ledgerSequence: raw.ledger,
-      timestamp,
-      contractId: raw.contractId,
+      ...base,
       eventType,
       address,
       addressTo,
